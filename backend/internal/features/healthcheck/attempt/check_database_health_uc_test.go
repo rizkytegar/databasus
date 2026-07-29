@@ -6,17 +6,59 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 
 	"databasus-backend/internal/features/databases"
 	healthcheck_config "databasus-backend/internal/features/healthcheck/config"
 	"databasus-backend/internal/features/notifiers"
+	notifier_models "databasus-backend/internal/features/notifiers/models"
 	"databasus-backend/internal/features/storages"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
 )
+
+func unavailableNotification(databaseName string) notifier_models.Notification {
+	return notifier_models.Notification{
+		Type:    notifier_models.NotificationTypeHealthcheckFailed,
+		Heading: fmt.Sprintf("❌ [%s] DB is unavailable", databaseName),
+		Message: fmt.Sprintf("❌ [%s] DB is currently unavailable", databaseName),
+	}
+}
+
+func onlineNotification(databaseName string) notifier_models.Notification {
+	return notifier_models.Notification{
+		Type:    notifier_models.NotificationTypeHealthcheckSuccess,
+		Heading: fmt.Sprintf("✅ [%s] DB is online", databaseName),
+		Message: fmt.Sprintf("✅ [%s] DB is back online", databaseName),
+	}
+}
+
+const anyPhysicalVersionTag = "17"
+
+func newTestUseCase(
+	healthcheckAttemptSender HealthcheckAttemptSender,
+	databaseService DatabaseService,
+) *CheckDatabaseHealthUseCase {
+	return &CheckDatabaseHealthUseCase{
+		&HealthcheckAttemptRepository{},
+		healthcheckAttemptSender,
+		databaseService,
+	}
+}
+
+func newTestHealthcheckConfig(databaseID uuid.UUID) *healthcheck_config.HealthcheckConfig {
+	return &healthcheck_config.HealthcheckConfig{
+		DatabaseID:                        databaseID,
+		IsHealthcheckEnabled:              true,
+		IsSentNotificationWhenUnavailable: true,
+		IntervalMinutes:                   1,
+		AttemptsBeforeConcideredAsDown:    1,
+		StoreAttemptsDays:                 7,
+	}
+}
 
 func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
@@ -42,7 +84,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 
 		// Setup mock notifier sender
 		mockSender := &MockHealthcheckAttemptSender{}
-		mockSender.On("SendNotification", mock.Anything, mock.Anything, mock.Anything).Return()
+		mockSender.On("SendNotification", mock.Anything, mock.Anything).Return()
 
 		// Setup mock database service
 		mockDatabaseService := &MockDatabaseService{}
@@ -65,11 +107,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 		}
 
 		// Create use case with mock sender
-		useCase := &CheckDatabaseHealthUseCase{
-			healthcheckAttemptRepository: &HealthcheckAttemptRepository{},
-			healthcheckAttemptSender:     mockSender,
-			databaseService:              mockDatabaseService,
-		}
+		useCase := newTestUseCase(mockSender, mockDatabaseService)
 
 		// Execute healthcheck
 		err := useCase.Execute(time.Now().UTC(), healthcheckConfig)
@@ -97,8 +135,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 			t,
 			"SendNotification",
 			mock.Anything,
-			fmt.Sprintf("❌ [%s] DB is unavailable", database.Name),
-			fmt.Sprintf("❌ [%s] DB is currently unavailable", database.Name),
+			unavailableNotification(database.Name),
 		)
 	})
 
@@ -129,11 +166,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 			}
 
 			// Create use case with mock sender
-			useCase := &CheckDatabaseHealthUseCase{
-				healthcheckAttemptRepository: &HealthcheckAttemptRepository{},
-				healthcheckAttemptSender:     mockSender,
-				databaseService:              mockDatabaseService,
-			}
+			useCase := newTestUseCase(mockSender, mockDatabaseService)
 
 			// Execute first healthcheck
 			err := useCase.Execute(time.Now().UTC(), healthcheckConfig)
@@ -162,8 +195,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 				t,
 				"SendNotification",
 				mock.Anything,
-				fmt.Sprintf("❌ [%s] DB is unavailable", database.Name),
-				fmt.Sprintf("❌ [%s] DB is currently unavailable", database.Name),
+				unavailableNotification(database.Name),
 			)
 		},
 	)
@@ -183,7 +215,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 
 			// Setup mock notifier sender
 			mockSender := &MockHealthcheckAttemptSender{}
-			mockSender.On("SendNotification", mock.Anything, mock.Anything, mock.Anything).Return()
+			mockSender.On("SendNotification", mock.Anything, mock.Anything).Return()
 
 			// Setup mock database service
 			mockDatabaseService := &MockDatabaseService{}
@@ -206,11 +238,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 			}
 
 			// Create use case with mock sender
-			useCase := &CheckDatabaseHealthUseCase{
-				healthcheckAttemptRepository: &HealthcheckAttemptRepository{},
-				healthcheckAttemptSender:     mockSender,
-				databaseService:              mockDatabaseService,
-			}
+			useCase := newTestUseCase(mockSender, mockDatabaseService)
 
 			// Execute three failed healthchecks
 			now := time.Now().UTC()
@@ -241,8 +269,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 				t,
 				"SendNotification",
 				mock.Anything,
-				fmt.Sprintf("❌ [%s] DB is unavailable", database.Name),
-				fmt.Sprintf("❌ [%s] DB is currently unavailable", database.Name),
+				unavailableNotification(database.Name),
 			)
 		},
 	)
@@ -260,7 +287,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 
 		// Setup mock notifier sender
 		mockSender := &MockHealthcheckAttemptSender{}
-		mockSender.On("SendNotification", mock.Anything, mock.Anything, mock.Anything).Return()
+		mockSender.On("SendNotification", mock.Anything, mock.Anything).Return()
 
 		// Setup mock database service - connection succeeds
 		mockDatabaseService := &MockDatabaseService{}
@@ -282,11 +309,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 		}
 
 		// Create use case with mock sender
-		useCase := &CheckDatabaseHealthUseCase{
-			healthcheckAttemptRepository: &HealthcheckAttemptRepository{},
-			healthcheckAttemptSender:     mockSender,
-			databaseService:              mockDatabaseService,
-		}
+		useCase := newTestUseCase(mockSender, mockDatabaseService)
 
 		// Execute healthcheck (should succeed)
 		err = useCase.Execute(time.Now().UTC(), healthcheckConfig)
@@ -314,8 +337,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 			t,
 			"SendNotification",
 			mock.Anything,
-			fmt.Sprintf("✅ [%s] DB is online", database.Name),
-			fmt.Sprintf("✅ [%s] DB is back online", database.Name),
+			onlineNotification(database.Name),
 		)
 	})
 
@@ -327,7 +349,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 
 			// Setup mock notifier sender
 			mockSender := &MockHealthcheckAttemptSender{}
-			mockSender.On("SendNotification", mock.Anything, mock.Anything, mock.Anything).Return()
+			mockSender.On("SendNotification", mock.Anything, mock.Anything).Return()
 
 			// Setup mock database service - connection succeeds
 			mockDatabaseService := &MockDatabaseService{}
@@ -349,11 +371,7 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 			}
 
 			// Create use case with mock sender
-			useCase := &CheckDatabaseHealthUseCase{
-				healthcheckAttemptRepository: &HealthcheckAttemptRepository{},
-				healthcheckAttemptSender:     mockSender,
-				databaseService:              mockDatabaseService,
-			}
+			useCase := newTestUseCase(mockSender, mockDatabaseService)
 
 			// Execute first healthcheck
 			now := time.Now().UTC()
@@ -421,6 +439,92 @@ func Test_CheckDatabaseHealthUseCase(t *testing.T) {
 			)
 			assert.Equal(t, databases.HealthStatusAvailable, attempts[0].Status)
 			assert.Equal(t, databases.HealthStatusAvailable, attempts[1].Status)
+		},
+	)
+
+	t.Run(
+		"Test_CheckPhysicalDbHealth_WhenClusterIsReplicationReady_AttemptMarkedAvailable",
+		func(t *testing.T) {
+			for _, physicalVersionTag := range databases.PhysicalPostgresVersionTags {
+				t.Run("pg"+physicalVersionTag, func(t *testing.T) {
+					database := databases.CreateTestPhysicalPostgresDatabase(
+						workspace.ID,
+						notifier,
+						physicalVersionTag,
+					)
+					defer databases.RemoveTestDatabase(database)
+
+					mockSender := &MockHealthcheckAttemptSender{}
+					mockSender.On("SendNotification", mock.Anything, mock.Anything).Return()
+
+					useCase := newTestUseCase(mockSender, databases.GetDatabaseService())
+
+					err := useCase.Execute(time.Now().UTC(), newTestHealthcheckConfig(database.ID))
+					assert.NoError(t, err)
+
+					attempts, err := useCase.healthcheckAttemptRepository.FindByDatabaseIDWithLimit(
+						database.ID,
+						1,
+					)
+					assert.NoError(t, err)
+					assert.Len(t, attempts, 1)
+					assert.Equal(t, databases.HealthStatusAvailable, attempts[0].Status)
+
+					persistedDatabase, err := databases.GetDatabaseService().
+						GetDatabaseByID(database.ID)
+					assert.NoError(t, err)
+					if assert.NotNil(t, persistedDatabase.HealthStatus) {
+						assert.Equal(
+							t,
+							databases.HealthStatusAvailable,
+							*persistedDatabase.HealthStatus,
+						)
+					}
+				})
+			}
+		},
+	)
+
+	t.Run(
+		"Test_CheckPhysicalDbHealth_WhenConnectionFails_DbMarkedAsUnavailable",
+		func(t *testing.T) {
+			database := databases.CreateTestPhysicalPostgresDatabase(
+				workspace.ID,
+				notifier,
+				anyPhysicalVersionTag,
+			)
+			defer databases.RemoveTestDatabase(database)
+
+			mockSender := &MockHealthcheckAttemptSender{}
+			mockSender.On("SendNotification", mock.Anything, mock.Anything).Return()
+
+			mockDatabaseService := &MockDatabaseService{}
+			mockDatabaseService.On("TestDatabaseConnectionDirect", database).
+				Return(errors.New("replication connection refused"))
+			unavailableStatus := databases.HealthStatusUnavailable
+			mockDatabaseService.On("SetHealthStatus", database.ID, &unavailableStatus).Return(nil)
+			mockDatabaseService.On("GetDatabaseByID", database.ID).Return(database, nil)
+
+			useCase := newTestUseCase(mockSender, mockDatabaseService)
+
+			err := useCase.Execute(time.Now().UTC(), newTestHealthcheckConfig(database.ID))
+			assert.NoError(t, err)
+
+			attempts, err := useCase.healthcheckAttemptRepository.FindByDatabaseIDWithLimit(
+				database.ID,
+				1,
+			)
+			assert.NoError(t, err)
+			assert.Len(t, attempts, 1)
+			assert.Equal(t, databases.HealthStatusUnavailable, attempts[0].Status)
+
+			mockDatabaseService.AssertCalled(t, "SetHealthStatus", database.ID, &unavailableStatus)
+			mockSender.AssertCalled(
+				t,
+				"SendNotification",
+				mock.Anything,
+				unavailableNotification(database.Name),
+			)
 		},
 	)
 }

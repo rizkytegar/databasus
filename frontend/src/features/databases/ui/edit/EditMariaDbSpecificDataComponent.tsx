@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 
 import { type Database, databaseApi } from '../../../../entity/databases';
 import { MariadbConnectionStringParser } from '../../../../entity/databases/model/mariadb/MariadbConnectionStringParser';
+import { NAME_LIST_TOKEN_SEPARATORS, normalizeNameList } from '../../../../shared/lib';
 import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
 import { ClipboardPasteModalComponent } from '../../../../shared/ui';
@@ -48,7 +49,10 @@ export const EditMariaDbSpecificDataComponent = ({
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
 
   const hasAdvancedValues =
-    !!database.mariadb?.isExcludeEvents || !!database.mariadb?.excludeTables?.length;
+    !!database.mariadb?.isExcludeEvents ||
+    !!database.mariadb?.isUseExtendedInsert ||
+    !!database.mariadb?.isSkipGaleraDisable ||
+    !!database.mariadb?.excludeTables?.length;
   const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
 
   const [isShowPasteModal, setIsShowPasteModal] = useState(false);
@@ -378,6 +382,64 @@ export const EditMariaDbSpecificDataComponent = ({
           </div>
 
           <div className="mb-1 flex w-full items-center">
+            <div className="min-w-[150px]">Use extended inserts</div>
+            <div className="flex items-center">
+              <Checkbox
+                checked={editingDatabase.mariadb?.isUseExtendedInsert || false}
+                onChange={(e) => {
+                  if (!editingDatabase.mariadb) return;
+
+                  setEditingDatabase({
+                    ...editingDatabase,
+                    mariadb: {
+                      ...editingDatabase.mariadb,
+                      isUseExtendedInsert: e.target.checked,
+                    },
+                  });
+                }}
+              >
+                Enable extended inserts
+              </Checkbox>
+
+              <Tooltip
+                className="cursor-pointer"
+                title="Batch multiple rows per INSERT for much faster restores. Off by default because it uses more memory during backup - enable only if restores are slow and your server has enough memory."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          </div>
+
+          <div className="mb-1 flex w-full items-center">
+            <div className="min-w-[150px]">Galera replication</div>
+            <div className="flex items-center">
+              <Checkbox
+                checked={editingDatabase.mariadb?.isSkipGaleraDisable || false}
+                onChange={(e) => {
+                  if (!editingDatabase.mariadb) return;
+
+                  setEditingDatabase({
+                    ...editingDatabase,
+                    mariadb: {
+                      ...editingDatabase.mariadb,
+                      isSkipGaleraDisable: e.target.checked,
+                    },
+                  });
+                }}
+              >
+                Skip disabling on restore
+              </Checkbox>
+
+              <Tooltip
+                className="cursor-pointer"
+                title="By default Databasus runs SET SESSION wsrep_on=OFF during restore to avoid Galera writeset-size errors. That requires the SUPER privilege. Enable this to skip it if your managed provider denies SUPER - large restores may then hit Galera writeset limits."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          </div>
+
+          <div className="mb-1 flex w-full items-center">
             <div className="min-w-[150px]">Exclude tables</div>
             <Select
               mode="tags"
@@ -387,16 +449,19 @@ export const EditMariaDbSpecificDataComponent = ({
 
                 setEditingDatabase({
                   ...editingDatabase,
-                  mariadb: { ...editingDatabase.mariadb, excludeTables: values },
+                  mariadb: { ...editingDatabase.mariadb, excludeTables: normalizeNameList(values) },
                 });
               }}
               size="small"
               className="max-w-[200px] grow"
               placeholder="No tables excluded"
-              tokenSeparators={[',']}
+              tokenSeparators={NAME_LIST_TOKEN_SEPARATORS}
             />
 
-            <Tooltip className="cursor-pointer" title="Table names to exclude from the backup.">
+            <Tooltip
+              className="cursor-pointer"
+              title="Table names to exclude from the backup. You can paste a list separated by commas or new lines."
+            >
               <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
             </Tooltip>
           </div>

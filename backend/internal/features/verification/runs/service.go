@@ -15,6 +15,7 @@ import (
 	backups_core_logical "databasus-backend/internal/features/backups/backups/core/logical"
 	backups_services "databasus-backend/internal/features/backups/backups/services"
 	"databasus-backend/internal/features/databases"
+	notifier_models "databasus-backend/internal/features/notifiers/models"
 	users_models "databasus-backend/internal/features/users/models"
 	verification_agents "databasus-backend/internal/features/verification/agents"
 	verification_config "databasus-backend/internal/features/verification/config"
@@ -151,7 +152,9 @@ func (s *VerificationService) CancelVerification(
 		return fmt.Errorf("verification is not cancellable (status: %s)", verification.Status)
 	}
 
-	if err := s.verificationRepository.MarkTerminal(nil, verificationID, VerificationStatusCanceled, nil); err != nil {
+	if err := s.verificationRepository.MarkTerminal(nil, verificationID, VerificationStatusCanceled, map[string]any{
+		"fail_message": cancelMessageByUser,
+	}); err != nil {
 		return err
 	}
 
@@ -549,7 +552,9 @@ func (s *VerificationService) cancelPendingAutoScheduledVerificationsByDatabaseI
 
 		if row.Status == VerificationStatusPending {
 			if cancelErr := s.verificationRepository.MarkTerminal(
-				tx, row.ID, VerificationStatusCanceled, nil,
+				tx, row.ID, VerificationStatusCanceled, map[string]any{
+					"fail_message": cancelMessageSupersededByBackup,
+				},
 			); cancelErr != nil {
 				return cancelErr
 			}
@@ -687,9 +692,20 @@ func (s *VerificationService) notifyTerminal(
 
 	title, body := buildNotificationCopy(verification, database, terminalStatus, failMessage)
 
+	sentNotificationType := notifier_models.NotificationTypeVerificationSuccess
+	if wantedType == verification_config.NotificationVerificationFailed {
+		sentNotificationType = notifier_models.NotificationTypeVerificationFailed
+	}
+
+	notification := notifier_models.Notification{
+		Type:    sentNotificationType,
+		Heading: title,
+		Message: body,
+	}
+
 	for i := range database.Notifiers {
 		notifier := database.Notifiers[i]
-		go s.notifierService.SendNotification(&notifier, title, body)
+		go s.notifierService.SendNotification(&notifier, notification)
 	}
 }
 
@@ -732,6 +748,12 @@ func sanitizeDatabaseForAgent(database *databases.Database) *databases.Database 
 
 	return database
 }
+
+const (
+	cancelMessageByUser             = "verification canceled by user"
+	cancelMessageScheduleDisabled   = "verification canceled: its verification schedule was disabled"
+	cancelMessageSupersededByBackup = "verification canceled: superseded by a newer backup's scheduled verification"
+)
 
 func failureMessageFor(reason FailureReason, agentMessage *string) string {
 	hasAgentMessage := agentMessage != nil && *agentMessage != ""

@@ -61,8 +61,8 @@ func newTestModel(t *testing.T, port string) *PostgresqlPhysicalDatabase {
 	return newTestModelAt(t, config.GetEnv().TestLocalhost, portInt)
 }
 
-// newTestModelAt builds a test model pointed at an explicit host:port — used for the throwaway
-// testcontainers sources, whose host may differ from TestLocalhost under TESTCONTAINERS_HOST_OVERRIDE.
+// Throwaway testcontainers sources get an ephemeral mapped port, unlike the fixed compose fixtures
+// reachable at TestLocalhost.
 func newTestModelAt(t *testing.T, host string, port int) *PostgresqlPhysicalDatabase {
 	t.Helper()
 
@@ -531,6 +531,20 @@ func Test_TestReplicationConnection_FailsForFullIncrementalWalStreamWhenSummariz
 			assert.Equal(t, postgresql_shared.ConnErrWalSummaryDisabled, connTestErrorCode(t, err))
 		})
 	}
+}
+
+func Test_ReadReplicationSettings_OnPreSummarizeWalVersion_DefaultsSummarizeWalToOff(t *testing.T) {
+	source := containers.StartPostgres(t, "postgres:16")
+
+	conn := openTestConnAt(t, source.Host, source.Port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settings, err := readReplicationSettings(ctx, conn)
+
+	require.NoError(t, err)
+	assert.Equal(t, "off", settings.summarizeWal)
 }
 
 func Test_TestReplicationConnection_SucceedsForFullOnlyWhenSummarizeWalOff(t *testing.T) {

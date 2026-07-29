@@ -11,6 +11,7 @@ import (
 
 	"databasus-backend/internal/features/databases"
 	healthcheck_config "databasus-backend/internal/features/healthcheck/config"
+	notifier_models "databasus-backend/internal/features/notifiers/models"
 	"databasus-backend/internal/util/logger"
 )
 
@@ -29,11 +30,6 @@ func (uc *CheckDatabaseHealthUseCase) Execute(
 		return err
 	}
 
-	err = uc.validateDatabase(database)
-	if err != nil {
-		return err
-	}
-
 	isExecuteNewAttempt, err := uc.isReadyForNewAttempt(
 		now,
 		database,
@@ -47,13 +43,12 @@ func (uc *CheckDatabaseHealthUseCase) Execute(
 		return nil
 	}
 
-	heathcheckAttempt, err := uc.healthcheckDatabase(now, database)
+	healthcheckAttempt, err := uc.healthcheckDatabase(now, database)
 	if err != nil {
 		return err
 	}
 
-	// Save the attempt
-	err = uc.healthcheckAttemptRepository.Insert(heathcheckAttempt)
+	err = uc.healthcheckAttemptRepository.Insert(healthcheckAttempt)
 	if err != nil {
 		return err
 	}
@@ -61,7 +56,7 @@ func (uc *CheckDatabaseHealthUseCase) Execute(
 	err = uc.updateDatabaseHealthStatusIfChanged(
 		database,
 		healthcheckConfig,
-		heathcheckAttempt,
+		healthcheckAttempt,
 	)
 	if err != nil {
 		return err
@@ -81,18 +76,18 @@ func (uc *CheckDatabaseHealthUseCase) Execute(
 func (uc *CheckDatabaseHealthUseCase) updateDatabaseHealthStatusIfChanged(
 	database *databases.Database,
 	healthcheckConfig *healthcheck_config.HealthcheckConfig,
-	heathcheckAttempt *HealthcheckAttempt,
+	healthcheckAttempt *HealthcheckAttempt,
 ) error {
-	if &heathcheckAttempt.Status == database.HealthStatus {
+	if database.HealthStatus != nil && *database.HealthStatus == healthcheckAttempt.Status {
 		return nil
 	}
 
 	if (database.HealthStatus == nil ||
 		*database.HealthStatus == databases.HealthStatusUnavailable) &&
-		heathcheckAttempt.Status == databases.HealthStatusAvailable {
+		healthcheckAttempt.Status == databases.HealthStatusAvailable {
 		err := uc.databaseService.SetHealthStatus(
 			database.ID,
-			&heathcheckAttempt.Status,
+			&healthcheckAttempt.Status,
 		)
 		if err != nil {
 			return err
@@ -101,16 +96,14 @@ func (uc *CheckDatabaseHealthUseCase) updateDatabaseHealthStatusIfChanged(
 		uc.sendDbStatusNotification(
 			healthcheckConfig,
 			database,
-			heathcheckAttempt.Status,
+			healthcheckAttempt.Status,
 		)
 	}
 
 	if (database.HealthStatus == nil ||
 		*database.HealthStatus == databases.HealthStatusAvailable) &&
-		heathcheckAttempt.Status == databases.HealthStatusUnavailable {
-		if healthcheckConfig.AttemptsBeforeConcideredAsDown <= 1 {
-			// proceed, 1 fail is enough to consider db as down
-		} else {
+		healthcheckAttempt.Status == databases.HealthStatusUnavailable {
+		if healthcheckConfig.AttemptsBeforeConcideredAsDown > 1 {
 			lastHealthcheckAttempts, err := uc.healthcheckAttemptRepository.FindByDatabaseIDWithLimit(
 				database.ID,
 				healthcheckConfig.AttemptsBeforeConcideredAsDown,
@@ -132,7 +125,7 @@ func (uc *CheckDatabaseHealthUseCase) updateDatabaseHealthStatusIfChanged(
 
 		err := uc.databaseService.SetHealthStatus(
 			database.ID,
-			&heathcheckAttempt.Status,
+			&healthcheckAttempt.Status,
 		)
 		if err != nil {
 			return err
@@ -152,7 +145,6 @@ func (uc *CheckDatabaseHealthUseCase) healthcheckDatabase(
 	now time.Time,
 	database *databases.Database,
 ) (*HealthcheckAttempt, error) {
-	// Test the connection
 	healthStatus := databases.HealthStatusAvailable
 	err := uc.databaseService.TestDatabaseConnectionDirect(database)
 	if err != nil {
@@ -165,7 +157,6 @@ func (uc *CheckDatabaseHealthUseCase) healthcheckDatabase(
 			)
 	}
 
-	// Create health check attempt
 	attempt := &HealthcheckAttempt{
 		ID:         uuid.New(),
 		DatabaseID: database.ID,
@@ -174,33 +165,6 @@ func (uc *CheckDatabaseHealthUseCase) healthcheckDatabase(
 	}
 
 	return attempt, nil
-}
-
-func (uc *CheckDatabaseHealthUseCase) validateDatabase(
-	database *databases.Database,
-) error {
-	switch database.Type {
-	case databases.DatabaseTypePostgresLogical:
-		if database.PostgresqlLogical == nil {
-			return fmt.Errorf("database Postgresql config is not set")
-		}
-	case databases.DatabaseTypeMysql:
-		if database.Mysql == nil {
-			return fmt.Errorf("database MySQL config is not set")
-		}
-	case databases.DatabaseTypeMariadb:
-		if database.Mariadb == nil {
-			return fmt.Errorf("database MariaDB config is not set")
-		}
-	case databases.DatabaseTypeMongodb:
-		if database.Mongodb == nil {
-			return fmt.Errorf("database MongoDB config is not set")
-		}
-	default:
-		return fmt.Errorf("unsupported database type: %s", database.Type)
-	}
-
-	return nil
 }
 
 func (uc *CheckDatabaseHealthUseCase) isReadyForNewAttempt(
@@ -234,22 +198,21 @@ func (uc *CheckDatabaseHealthUseCase) sendDbStatusNotification(
 		return
 	}
 
-	messageTitle := ""
-	messageBody := ""
+	notification := notifier_models.Notification{
+		Type:    notifier_models.NotificationTypeHealthcheckFailed,
+		Heading: fmt.Sprintf("❌ [%s] DB is unavailable", database.Name),
+		Message: fmt.Sprintf("❌ [%s] DB is currently unavailable", database.Name),
+	}
 
 	if newHealthStatus == databases.HealthStatusAvailable {
-		messageTitle = fmt.Sprintf("✅ [%s] DB is online", database.Name)
-		messageBody = fmt.Sprintf("✅ [%s] DB is back online", database.Name)
-	} else {
-		messageTitle = fmt.Sprintf("❌ [%s] DB is unavailable", database.Name)
-		messageBody = fmt.Sprintf("❌ [%s] DB is currently unavailable", database.Name)
+		notification = notifier_models.Notification{
+			Type:    notifier_models.NotificationTypeHealthcheckSuccess,
+			Heading: fmt.Sprintf("✅ [%s] DB is online", database.Name),
+			Message: fmt.Sprintf("✅ [%s] DB is back online", database.Name),
+		}
 	}
 
 	for _, notifier := range database.Notifiers {
-		uc.healthcheckAttemptSender.SendNotification(
-			&notifier,
-			messageTitle,
-			messageBody,
-		)
+		uc.healthcheckAttemptSender.SendNotification(&notifier, notification)
 	}
 }

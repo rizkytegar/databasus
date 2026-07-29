@@ -3,6 +3,7 @@ package backuping_physical
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -81,9 +82,11 @@ var physicalWalStreamSupervisor = &PhysicalWalStreamSupervisor{
 	encryption_secrets.GetSecretKeyService(),
 	encryption.GetFieldEncryptor(),
 	logger.GetLogger(),
+	defaultChainAlertMinInterval,
 	sync.Mutex{},
 	make(map[uuid.UUID]*runningStreamer),
 	atomicTime{},
+	make(map[chainAlertKey]time.Time),
 	atomic.Bool{},
 	atomic.Bool{},
 }

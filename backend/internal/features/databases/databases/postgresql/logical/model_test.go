@@ -17,6 +17,8 @@ import (
 	"databasus-backend/internal/util/tools"
 )
 
+const heavyTableMinSizeMb = 10.0
+
 func Test_TestConnection_PasswordContainingSpaces_TestedSuccessfully(t *testing.T) {
 	container := connectToPostgresContainer(t, "postgres:16")
 	defer container.DB.Close()
@@ -173,8 +175,101 @@ func Test_PostgresqlModel_AcrossSupportedVersions(t *testing.T) {
 			t.Run("Test_CreateReadOnlyUser_PublicSchemaExistsButNoPermissions_ReturnsError", func(t *testing.T) {
 				testCreateReadOnlyUserPublicSchemaExistsButNoPermissions(t, endpoint, dbVersion.tag)
 			})
+
+			t.Run("Test_TestConnection_WhenUserMappingUnreadableAndFlagFalse_ReturnsError", func(t *testing.T) {
+				testConnectionUserMappingUnreadableFlagFalse(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenUserMappingUnreadableAndFlagTrue_NoError", func(t *testing.T) {
+				testConnectionUserMappingUnreadableFlagTrue(t, endpoint, dbVersion.tag)
+			})
 		})
 	}
+}
+
+// setupUnreadableUserMappingModel sets up a superuser-owned user mapping and a limited role that
+// passes the backup-permission checks (CONNECT/USAGE/SELECT) yet cannot read the mapping's options.
+// postgres_fdw stands in for oracle_fdw, which is not installable in CI.
+func setupUnreadableUserMappingModel(
+	t *testing.T,
+	container *PostgresContainer,
+	version string,
+) *PostgresqlLogicalDatabase {
+	suffix := uuid.New().String()[:8]
+	limitedUsername := fmt.Sprintf("um_limited_%s", suffix)
+	limitedPassword := "limitedpassword123"
+	serverName := fmt.Sprintf("um_test_srv_%s", suffix)
+	tableName := fmt.Sprintf("um_test_table_%s", suffix)
+
+	setupStatements := []string{
+		fmt.Sprintf(`CREATE TABLE %s (id SERIAL PRIMARY KEY, data TEXT NOT NULL)`, tableName),
+		fmt.Sprintf(`INSERT INTO %s (data) VALUES ('row1')`, tableName),
+		`CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
+		fmt.Sprintf(
+			`CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host 'localhost', dbname 'postgres')`,
+			serverName,
+		),
+		fmt.Sprintf(
+			`CREATE USER MAPPING FOR CURRENT_USER SERVER %s OPTIONS ("user" 'remote', password 'secret')`,
+			serverName,
+		),
+		fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '%s' LOGIN`, limitedUsername, limitedPassword),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE "%s" TO "%s"`, container.Database, limitedUsername),
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO "%s"`, limitedUsername),
+		fmt.Sprintf(`GRANT SELECT ON %s TO "%s"`, tableName, limitedUsername),
+	}
+
+	for _, statement := range setupStatements {
+		_, err := container.DB.Exec(statement)
+		assert.NoError(t, err)
+	}
+
+	t.Cleanup(func() {
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP SERVER IF EXISTS %s CASCADE`, serverName))
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, tableName))
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP OWNED BY "%s"`, limitedUsername))
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP USER IF EXISTS "%s"`, limitedUsername))
+	})
+
+	return &PostgresqlLogicalDatabase{
+		Version:  tools.GetPostgresqlVersionEnum(version),
+		Host:     container.Host,
+		Port:     container.Port,
+		Username: limitedUsername,
+		Password: limitedPassword,
+		Database: &container.Database,
+		SslMode:  postgresql_shared.PostgresSslModeDisable,
+		CpuCount: 1,
+	}
+}
+
+func testConnectionUserMappingUnreadableFlagFalse(t *testing.T, endpoint containers.Endpoint, version string) {
+	container := connectToPostgresEndpoint(t, endpoint)
+	defer container.DB.Close()
+
+	limitedModel := setupUnreadableUserMappingModel(t, container, version)
+	limitedModel.IsSkipUserMappings = false
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	err := limitedModel.TestConnection(logger, nil)
+	assert.Error(t, err)
+	if err != nil {
+		assert.Contains(t, err.Error(), "user mapping")
+	}
+}
+
+func testConnectionUserMappingUnreadableFlagTrue(t *testing.T, endpoint containers.Endpoint, version string) {
+	container := connectToPostgresEndpoint(t, endpoint)
+	defer container.DB.Close()
+
+	limitedModel := setupUnreadableUserMappingModel(t, container, version)
+	limitedModel.IsSkipUserMappings = true
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	err := limitedModel.TestConnection(logger, nil)
+	assert.NoError(t, err)
 }
 
 func testConnectionInsufficientPermissions(t *testing.T, endpoint containers.Endpoint, version string) {
@@ -1518,6 +1613,164 @@ func Test_GetRawDbSizeMb_Postgresql_ReturnsPositiveSize(t *testing.T) {
 	assert.Greater(t, sizeMB, 0.0, "raw db size should be > 0 after inserting data")
 }
 
+func Test_GetRawDbSizeMb_WhenExcludeTablesSet_SkipsExcludedTableSize(t *testing.T) {
+	container := connectToPostgresContainer(t, "postgres:16")
+	defer container.DB.Close()
+
+	seededSchema := seedSizeTestSchema(t, container)
+
+	pgModel := createPostgresModel(container)
+	pgModel.IncludeSchemas = []string{seededSchema.SchemaName}
+
+	sizeWithHeavyTableMb := measureRawDbSizeMb(t, pgModel)
+
+	pgModel.ExcludeTables = []string{seededSchema.SchemaName + "." + seededSchema.HeavyTableName}
+	sizeWithoutHeavyTableMb := measureRawDbSizeMb(t, pgModel)
+
+	assert.InDelta(
+		t,
+		measureRelationsSizeMb(t, container, relationName{seededSchema.SchemaName, seededSchema.LightTableName}),
+		sizeWithoutHeavyTableMb,
+		0.5,
+		"excluded table size must not be counted",
+	)
+	assert.Greater(t, sizeWithHeavyTableMb-sizeWithoutHeavyTableMb, heavyTableMinSizeMb)
+}
+
+func Test_GetRawDbSizeMb_WhenExcludeTablesUsesGlobPattern_SkipsMatchingTables(t *testing.T) {
+	container := connectToPostgresContainer(t, "postgres:16")
+	defer container.DB.Close()
+
+	seededSchema := seedSizeTestSchema(t, container)
+
+	pgModel := createPostgresModel(container)
+	pgModel.IncludeSchemas = []string{seededSchema.SchemaName}
+	pgModel.ExcludeTables = []string{"heavy_*"}
+
+	assert.InDelta(
+		t,
+		measureRelationsSizeMb(t, container, relationName{seededSchema.SchemaName, seededSchema.LightTableName}),
+		measureRawDbSizeMb(t, pgModel),
+		0.5,
+		"glob-matched table size must not be counted",
+	)
+}
+
+func Test_GetRawDbSizeMb_WhenIncludeSchemasSet_CountsOnlyIncludedSchema(t *testing.T) {
+	container := connectToPostgresContainer(t, "postgres:16")
+	defer container.DB.Close()
+
+	includedSchema := seedSizeTestSchema(t, container)
+	otherSchema := seedSizeTestSchema(t, container)
+
+	pgModel := createPostgresModel(container)
+	pgModel.IncludeSchemas = []string{includedSchema.SchemaName}
+
+	sizeOfIncludedSchemaMb := measureRawDbSizeMb(t, pgModel)
+
+	pgModel.IncludeSchemas = []string{includedSchema.SchemaName, otherSchema.SchemaName}
+	sizeOfBothSchemasMb := measureRawDbSizeMb(t, pgModel)
+
+	assert.InDelta(
+		t,
+		measureRelationsSizeMb(
+			t, container,
+			relationName{includedSchema.SchemaName, includedSchema.HeavyTableName},
+			relationName{includedSchema.SchemaName, includedSchema.LightTableName},
+		),
+		sizeOfIncludedSchemaMb,
+		0.5,
+		"only the included schema must be counted",
+	)
+	assert.Greater(t, sizeOfBothSchemasMb-sizeOfIncludedSchemaMb, heavyTableMinSizeMb)
+}
+
+func Test_GetRawDbSizeMb_WhenIncludeSchemasAndExcludeTablesSet_AppliesBothFilters(t *testing.T) {
+	container := connectToPostgresContainer(t, "postgres:16")
+	defer container.DB.Close()
+
+	includedSchema := seedSizeTestSchema(t, container)
+	skippedSchema := seedSizeTestSchema(t, container)
+
+	pgModel := createPostgresModel(container)
+	pgModel.IncludeSchemas = []string{includedSchema.SchemaName}
+	pgModel.ExcludeTables = []string{
+		includedSchema.SchemaName + "." + includedSchema.HeavyTableName,
+		skippedSchema.SchemaName + "." + skippedSchema.LightTableName,
+	}
+
+	assert.InDelta(
+		t,
+		measureRelationsSizeMb(
+			t, container,
+			relationName{includedSchema.SchemaName, includedSchema.LightTableName},
+		),
+		measureRawDbSizeMb(t, pgModel),
+		0.5,
+		"schema filter and table exclusion must both apply",
+	)
+}
+
+func Test_GetRawDbSizeMb_WhenNoFiltersSet_CountsEveryUserTable(t *testing.T) {
+	container := connectToPostgresContainer(t, "postgres:16")
+	defer container.DB.Close()
+
+	firstSchema := seedSizeTestSchema(t, container)
+	secondSchema := seedSizeTestSchema(t, container)
+
+	pgModel := createPostgresModel(container)
+
+	sizeOfWholeDatabaseMb := measureRawDbSizeMb(t, pgModel)
+
+	pgModel.IncludeSchemas = []string{firstSchema.SchemaName}
+	sizeOfFirstSchemaMb := measureRawDbSizeMb(t, pgModel)
+
+	seededSchemasSizeMb := sizeOfFirstSchemaMb + measureRelationsSizeMb(
+		t, container,
+		relationName{secondSchema.SchemaName, secondSchema.HeavyTableName},
+		relationName{secondSchema.SchemaName, secondSchema.LightTableName},
+	)
+
+	assert.GreaterOrEqual(t, sizeOfWholeDatabaseMb, seededSchemasSizeMb-0.5)
+	assert.Greater(t, sizeOfWholeDatabaseMb-sizeOfFirstSchemaMb, heavyTableMinSizeMb)
+}
+
+func Test_GetRawDbSizeMb_WhenTableIsPartitioned_CountsEveryPartitionOnce(t *testing.T) {
+	container := connectToPostgresContainer(t, "postgres:16")
+	defer container.DB.Close()
+
+	schemaName := fmt.Sprintf("partitioned_size_%s", uuid.New().String()[:8])
+
+	_, err := container.DB.Exec(fmt.Sprintf(`
+		CREATE SCHEMA %s;
+		CREATE TABLE %s.events (id BIGINT, payload TEXT) PARTITION BY RANGE (id);
+		CREATE TABLE %s.events_first PARTITION OF %s.events FOR VALUES FROM (0) TO (10000);
+		CREATE TABLE %s.events_second PARTITION OF %s.events FOR VALUES FROM (10000) TO (20000);
+		INSERT INTO %s.events
+			SELECT generate_series(0, 19999), repeat('x', 1024);
+	`, schemaName, schemaName, schemaName, schemaName, schemaName, schemaName, schemaName))
+	assert.NoError(t, err)
+
+	t.Cleanup(func() {
+		_, _ = container.DB.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName))
+	})
+
+	pgModel := createPostgresModel(container)
+	pgModel.IncludeSchemas = []string{schemaName}
+
+	assert.InDelta(
+		t,
+		measureRelationsSizeMb(
+			t, container,
+			relationName{schemaName, "events_first"},
+			relationName{schemaName, "events_second"},
+		),
+		measureRawDbSizeMb(t, pgModel),
+		0.5,
+		"partitions must be counted once, without adding the partitioned parent",
+	)
+}
+
 func Test_HideSensitiveData_WhenCalled_ClearsPasswordAndPreservesOtherFields(t *testing.T) {
 	databaseName := "appdb"
 	pgModel := &PostgresqlLogicalDatabase{
@@ -1754,6 +2007,80 @@ func Test_Validate_WhenSslModeEmpty_DefaultsToDisable(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, postgresql_shared.PostgresSslModeDisable, model.SslMode)
+}
+
+type sizeTestSchema struct {
+	SchemaName     string
+	HeavyTableName string
+	LightTableName string
+}
+
+func seedSizeTestSchema(t *testing.T, container *PostgresContainer) sizeTestSchema {
+	t.Helper()
+
+	suffix := uuid.New().String()[:8]
+	seeded := sizeTestSchema{
+		SchemaName:     "size_" + suffix,
+		HeavyTableName: "heavy_" + suffix,
+		LightTableName: "light_" + suffix,
+	}
+
+	_, err := container.DB.Exec(fmt.Sprintf(`
+		CREATE SCHEMA %s;
+		CREATE TABLE %s.%s (id SERIAL PRIMARY KEY, payload TEXT NOT NULL);
+		CREATE TABLE %s.%s (id SERIAL PRIMARY KEY, payload TEXT NOT NULL);
+		INSERT INTO %s.%s (payload) SELECT repeat('x', 1024) FROM generate_series(1, 20000);
+		INSERT INTO %s.%s (payload) VALUES ('light');
+	`,
+		seeded.SchemaName,
+		seeded.SchemaName, seeded.HeavyTableName,
+		seeded.SchemaName, seeded.LightTableName,
+		seeded.SchemaName, seeded.HeavyTableName,
+		seeded.SchemaName, seeded.LightTableName,
+	))
+	assert.NoError(t, err)
+
+	t.Cleanup(func() {
+		_, _ = container.DB.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", seeded.SchemaName))
+	})
+
+	return seeded
+}
+
+func measureRawDbSizeMb(t *testing.T, pgModel *PostgresqlLogicalDatabase) float64 {
+	t.Helper()
+
+	sizeMb, err := pgModel.GetRawDbSizeMb(
+		t.Context(),
+		slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		nil,
+	)
+	assert.NoError(t, err)
+
+	return sizeMb
+}
+
+func measureRelationsSizeMb(
+	t *testing.T,
+	container *PostgresContainer,
+	relations ...relationName,
+) float64 {
+	t.Helper()
+
+	var totalSizeMb float64
+
+	for _, relation := range relations {
+		var relationSizeMb float64
+		err := container.DB.Get(&relationSizeMb, `
+			SELECT pg_total_relation_size(format('%I.%I', $1::text, $2::text)::regclass)
+				/ (1024.0 * 1024.0)
+		`, relation.SchemaName, relation.TableName)
+		assert.NoError(t, err)
+
+		totalSizeMb += relationSizeMb
+	}
+
+	return totalSizeMb
 }
 
 func connectToPostgresContainer(t *testing.T, image string) *PostgresContainer {

@@ -71,6 +71,35 @@ type postgresVersion struct {
 	image string
 }
 
+const skippedFromDumpTableMinSizeMb = 15.0
+
+func measureWholeDatabaseSizeMb(t *testing.T, db *sqlx.DB) float64 {
+	t.Helper()
+
+	var sizeMb float64
+	err := db.Get(&sizeMb, "SELECT pg_database_size(current_database()) / (1024.0 * 1024.0)")
+	assert.NoError(t, err)
+
+	return sizeMb
+}
+
+type relationRef struct {
+	SchemaName string
+	TableName  string
+}
+
+func measureTableSizeMb(t *testing.T, db *sqlx.DB, relation relationRef) float64 {
+	t.Helper()
+
+	var sizeMb float64
+	err := db.Get(&sizeMb, `
+		SELECT pg_total_relation_size(format('%I.%I', $1::text, $2::text)::regclass) / (1024.0 * 1024.0)
+	`, relation.SchemaName, relation.TableName)
+	assert.NoError(t, err)
+
+	return sizeMb
+}
+
 var postgresVersions = []postgresVersion{
 	{"PostgreSQL 12", "12", "postgres:12"},
 	{"PostgreSQL 13", "13", "postgres:13"},
@@ -145,6 +174,10 @@ func Test_PostgresqlBackupRestore_AcrossSupportedVersions(t *testing.T) {
 			t.Run("Test_BackupAndRestorePostgresql_WithReadOnlyUser_RestoreIsSuccessful", func(t *testing.T) {
 				testBackupRestoreWithReadOnlyUserForVersion(t, endpoint, dbVersion.tag)
 			})
+
+			t.Run("Test_BackupAndRestorePostgresql_WithSkipUserMappings_RestoreIsSuccessful", func(t *testing.T) {
+				testBackupRestoreSkipUserMappingsForVersion(t, endpoint, dbVersion.tag)
+			})
 		})
 	}
 }
@@ -189,6 +222,7 @@ func testBackupRestoreForVersion(t *testing.T, endpoint containers.Endpoint, pgV
 
 	backup := logicaltesting.WaitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
 	assert.Equal(t, backups_core_logical.BackupStatusCompleted, backup.Status)
+	logicaltesting.AssertBackupSizeMatchesDownloadedBytes(t, router, backup, user.Token)
 
 	newDBName := fmt.Sprintf("restoreddb_%s_cpu%d_%s", pgVersion, cpuCount, uuid.New().String()[:8])
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -492,6 +526,132 @@ func testBackupRestoreWithExcludeExtensionsForVersion(t *testing.T, endpoint con
 	assert.NotEmpty(t, newUUID, "uuid_generate_v4 should work")
 
 	// Cleanup
+	err = os.Remove(filepath.Join(config.GetEnv().DataFolder, backup.ID.String()))
+	if err != nil {
+		t.Logf("Warning: Failed to delete backup file: %v", err)
+	}
+
+	test_utils.MakeDeleteRequest(
+		t,
+		router,
+		"/api/v1/databases/"+database.ID.String(),
+		"Bearer "+user.Token,
+		http.StatusNoContent,
+	)
+	storages.RemoveTestStorage(storage.ID)
+	workspaces_testing.RemoveTestWorkspace(workspace, router)
+}
+
+// testBackupRestoreSkipUserMappingsForVersion backs up under a role that cannot read a user
+// mapping's options (so pg_dump emits a bare CREATE USER MAPPING) with IsSkipUserMappings enabled,
+// and asserts the restore succeeds with the mapping excluded. postgres_fdw stands in for
+// oracle_fdw, which is not installable in CI.
+func testBackupRestoreSkipUserMappingsForVersion(t *testing.T, endpoint containers.Endpoint, pgVersion string) {
+	container, err := connectToPostgresEndpoint(t, endpoint)
+	if err != nil {
+		t.Fatalf("Failed to connect to PostgreSQL container: %v", err)
+	}
+	defer container.DB.Close()
+
+	suffix := uuid.New().String()[:8]
+	limitedUsername := fmt.Sprintf("um_backup_%s", suffix)
+	limitedPassword := "limitedpassword123"
+	serverName := fmt.Sprintf("um_srv_%s", suffix)
+
+	setupStatements := []string{
+		`CREATE TABLE skip_um_data (id INT PRIMARY KEY, name TEXT NOT NULL)`,
+		`INSERT INTO skip_um_data (id, name) VALUES (1, 'row1'), (2, 'row2'), (3, 'row3')`,
+		`CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
+		fmt.Sprintf(
+			`CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host 'localhost', dbname 'postgres')`,
+			serverName,
+		),
+		fmt.Sprintf(
+			`CREATE USER MAPPING FOR CURRENT_USER SERVER %s OPTIONS ("user" 'remote', password 'secret')`,
+			serverName,
+		),
+		fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '%s' LOGIN`, limitedUsername, limitedPassword),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE "%s" TO "%s"`, container.Database, limitedUsername),
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO "%s"`, limitedUsername),
+		`GRANT SELECT ON skip_um_data TO "` + limitedUsername + `"`,
+	}
+
+	for _, statement := range setupStatements {
+		_, err = container.DB.Exec(statement)
+		assert.NoError(t, err)
+	}
+
+	defer func() {
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP SERVER IF EXISTS %s CASCADE`, serverName))
+		_, _ = container.DB.Exec(`DROP TABLE IF EXISTS skip_um_data CASCADE`)
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP OWNED BY "%s"`, limitedUsername))
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP USER IF EXISTS "%s"`, limitedUsername))
+	}()
+
+	router := logicaltesting.CreateTestRouter()
+	user := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Skip User Mappings Workspace", user, router)
+
+	storage := storages.CreateTestStorage(workspace.ID)
+
+	// Created under the limited role with IsSkipUserMappings enabled, so TestConnection's
+	// unreadable-user-mapping gate is bypassed and the backup runs as that role.
+	database := createDatabaseWithSkipUserMappingsViaAPI(
+		t, router, "Skip User Mappings Database", workspace.ID,
+		container.Host, container.Port,
+		limitedUsername, limitedPassword, container.Database,
+		user.Token,
+	)
+
+	logicaltesting.EnableBackupsViaAPI(
+		t, router, database.ID, storage.ID,
+		backups_core_enums.BackupEncryptionNone, user.Token,
+	)
+
+	logicaltesting.CreateBackupViaAPI(t, router, database.ID, user.Token)
+
+	backup := logicaltesting.WaitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
+	assert.Equal(t, backups_core_logical.BackupStatusCompleted, backup.Status)
+
+	newDBName := fmt.Sprintf("restored_skip_um_%s_%s", pgVersion, suffix)
+	_, err = container.DB.Exec(fmt.Sprintf("CREATE DATABASE %s;", newDBName))
+	assert.NoError(t, err)
+
+	defer func() {
+		_, _ = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
+	}()
+
+	newDSN := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		container.Host, container.Port, container.Username, container.Password, newDBName)
+	newDB, err := sqlx.Connect("postgres", newDSN)
+	assert.NoError(t, err)
+	defer newDB.Close()
+
+	// Restore connects as the admin so the dumped extension/server can be created; the source
+	// database's persisted IsSkipUserMappings flag drives the user-mapping exclusion.
+	createRestoreViaAPI(
+		t, router, backup.ID,
+		container.Host, container.Port,
+		container.Username, container.Password, newDBName,
+		user.Token,
+	)
+
+	restore := waitForRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
+
+	var rowCount int
+	err = newDB.Get(&rowCount, `SELECT COUNT(*) FROM skip_um_data`)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, rowCount, "table data should be restored")
+
+	var userMappingCount int
+	err = newDB.Get(&userMappingCount,
+		`SELECT COUNT(*) FROM pg_user_mappings um
+		 JOIN pg_foreign_server s ON s.oid = um.srvid
+		 WHERE s.srvname = $1`, serverName)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, userMappingCount, "user mapping should be excluded from the restore")
+
 	err = os.Remove(filepath.Join(config.GetEnv().DataFolder, backup.ID.String()))
 	if err != nil {
 		t.Logf("Warning: Failed to delete backup file: %v", err)
@@ -1028,6 +1188,8 @@ func testSchemaSelectionOnlySpecifiedSchemasForVersion(
 		INSERT INTO public.public_table (data) VALUES ('public_data');
 		INSERT INTO schema_a.table_a (data) VALUES ('schema_a_data');
 		INSERT INTO schema_b.table_b (data) VALUES ('schema_b_data');
+		INSERT INTO schema_b.table_b (data)
+			SELECT repeat('x', 1024) FROM generate_series(1, 20000);
 	`)
 	assert.NoError(t, err)
 
@@ -1062,6 +1224,19 @@ func testSchemaSelectionOnlySpecifiedSchemasForVersion(
 
 	backup := logicaltesting.WaitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
 	assert.Equal(t, backups_core_logical.BackupStatusCompleted, backup.Status)
+
+	skippedSchemaTableSizeMb := measureTableSizeMb(
+		t, container.DB,
+		relationRef{SchemaName: "schema_b", TableName: "table_b"},
+	)
+	assert.Greater(t, skippedSchemaTableSizeMb, skippedFromDumpTableMinSizeMb)
+	assert.Greater(t, backup.BackupRawDbSizeMb, 0.0)
+	assert.LessOrEqual(
+		t,
+		backup.BackupRawDbSizeMb+skippedSchemaTableSizeMb,
+		measureWholeDatabaseSizeMb(t, container.DB),
+		"recorded raw db size must not count schemas left out of the dump",
+	)
 
 	newDBName := fmt.Sprintf("restored_specific_schemas_%s_%s", pgVersion, uuid.New().String()[:8])
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -1156,7 +1331,8 @@ func testBackupRestoreWithExcludeTablesForVersion(t *testing.T, endpoint contain
 		CREATE TABLE public.%s (id SERIAL PRIMARY KEY, data TEXT);
 		INSERT INTO public.%s (data) VALUES ('keep_value');
 		INSERT INTO public.%s (data) VALUES ('drop_value');
-	`, keepTable, dropTable, keepTable, dropTable, keepTable, dropTable))
+		INSERT INTO public.%s (data) SELECT repeat('x', 1024) FROM generate_series(1, 20000);
+	`, keepTable, dropTable, keepTable, dropTable, keepTable, dropTable, dropTable))
 	assert.NoError(t, err)
 
 	defer func() {
@@ -1195,6 +1371,19 @@ func testBackupRestoreWithExcludeTablesForVersion(t *testing.T, endpoint contain
 
 	backup := logicaltesting.WaitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
 	assert.Equal(t, backups_core_logical.BackupStatusCompleted, backup.Status)
+
+	excludedTableSizeMb := measureTableSizeMb(
+		t, container.DB,
+		relationRef{SchemaName: "public", TableName: dropTable},
+	)
+	assert.Greater(t, excludedTableSizeMb, skippedFromDumpTableMinSizeMb)
+	assert.Greater(t, backup.BackupRawDbSizeMb, 0.0)
+	assert.LessOrEqual(
+		t,
+		backup.BackupRawDbSizeMb+excludedTableSizeMb,
+		measureWholeDatabaseSizeMb(t, container.DB),
+		"recorded raw db size must not count the excluded table",
+	)
 
 	newDBName := fmt.Sprintf("restored_excl_tables_%s_%s", pgVersion, suffix)
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -1599,6 +1788,53 @@ func createDatabaseWithCpuCountViaAPI(
 			Password: password,
 			Database: &database,
 			CpuCount: cpuCount,
+		},
+	}
+
+	w := workspaces_testing.MakeAPIRequest(
+		router,
+		"POST",
+		"/api/v1/databases/create",
+		"Bearer "+token,
+		request,
+	)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("Failed to create database. Status: %d, Body: %s", w.Code, w.Body.String())
+	}
+
+	var createdDatabase databases.Database
+	if err := json.Unmarshal(w.Body.Bytes(), &createdDatabase); err != nil {
+		t.Fatalf("Failed to unmarshal database response: %v", err)
+	}
+
+	return &createdDatabase
+}
+
+func createDatabaseWithSkipUserMappingsViaAPI(
+	t *testing.T,
+	router *gin.Engine,
+	name string,
+	workspaceID uuid.UUID,
+	host string,
+	port int,
+	username string,
+	password string,
+	database string,
+	token string,
+) *databases.Database {
+	request := databases.Database{
+		Name:        name,
+		WorkspaceID: &workspaceID,
+		Type:        databases.DatabaseTypePostgresLogical,
+		PostgresqlLogical: &pgtypes.PostgresqlLogicalDatabase{
+			Host:               host,
+			Port:               port,
+			Username:           username,
+			Password:           password,
+			Database:           &database,
+			CpuCount:           1,
+			IsSkipUserMappings: true,
 		},
 	}
 

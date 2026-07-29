@@ -23,7 +23,7 @@ import (
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
 	"databasus-backend/internal/features/storages"
 	"databasus-backend/internal/util/encryption"
-	io_utils "databasus-backend/internal/util/io"
+	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -32,6 +32,11 @@ const (
 	shutdownCheckInterval    = 1 * time.Second
 	copyBufferSize           = 8 * 1024 * 1024
 	progressReportIntervalMB = 1.0
+)
+
+var (
+	errBackupShutdown = errors.New("backup cancelled due to shutdown")
+	errBackupTimeout  = errors.New("backup cancelled due to timeout")
 )
 
 type CreateMongodbBackupUsecase struct {
@@ -107,8 +112,8 @@ func (uc *CreateMongodbBackupUsecase) buildMongodumpArgs(
 		"--gzip",
 	}
 
-	for _, collection := range mdb.ExcludeCollections {
-		args = append(args, "--excludeCollection="+collection)
+	for _, excludedCollection := range namelist.NormalizeUniqueNames(mdb.ExcludeCollections) {
+		args = append(args, "--excludeCollection="+excludedCollection)
 	}
 
 	// Use numParallelCollections based on CPU count
@@ -133,7 +138,7 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 	uc.logger.Info("Streaming MongoDB backup to storage", "mongodumpBin", mongodumpBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
-	defer cancel()
+	defer cancel(nil)
 
 	cmd := exec.CommandContext(ctx, mongodumpBin, args...)
 
@@ -180,8 +185,6 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	countingWriter := io_utils.NewCountingWriter(finalWriter)
-
 	saveErrCh := make(chan error, 1)
 	go func() {
 		saveErr := storage.SaveFile(
@@ -193,7 +196,7 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 		)
 		if saveErr != nil {
 			_ = storageReader.CloseWithError(saveErr)
-			cancel()
+			cancel(saveErr)
 		}
 		saveErrCh <- saveErr
 	}()
@@ -207,7 +210,7 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 	go func() {
 		bytesWritten, copyErr := uc.copyWithShutdownCheck(
 			ctx,
-			countingWriter,
+			finalWriter,
 			pgStdout,
 			backupProgressListener,
 		)
@@ -232,7 +235,7 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 	select {
 	case <-ctx.Done():
 		uc.cleanupOnCancellation(encryptionWriter, storageWriter, saveErrCh)
-		return nil, uc.checkCancellationReason()
+		return nil, uc.classifyCancellation(ctx)
 	default:
 	}
 
@@ -263,10 +266,14 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 
 func (uc *CreateMongodbBackupUsecase) createBackupContext(
 	parentCtx context.Context,
-) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(parentCtx, backupTimeout)
+) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(parentCtx)
+
+	timeout := time.AfterFunc(backupTimeout, func() { cancel(errBackupTimeout) })
 
 	go func() {
+		defer timeout.Stop()
+
 		ticker := time.NewTicker(shutdownCheckInterval)
 		defer ticker.Stop()
 		for {
@@ -275,7 +282,7 @@ func (uc *CreateMongodbBackupUsecase) createBackupContext(
 				return
 			case <-ticker.C:
 				if config.IsShouldShutdown() {
-					cancel()
+					cancel(errBackupShutdown)
 					return
 				}
 			}
@@ -417,11 +424,19 @@ func (uc *CreateMongodbBackupUsecase) closeWriters(
 	return nil
 }
 
-func (uc *CreateMongodbBackupUsecase) checkCancellationReason() error {
-	if config.IsShouldShutdown() {
+func (uc *CreateMongodbBackupUsecase) classifyCancellation(ctx context.Context) error {
+	cause := context.Cause(ctx)
+
+	switch {
+	case errors.Is(cause, errBackupShutdown):
 		return errors.New("backup cancelled due to shutdown")
+	case errors.Is(cause, errBackupTimeout):
+		return errors.New("backup cancelled due to timeout")
+	case cause == nil, errors.Is(cause, context.Canceled), errors.Is(cause, context.DeadlineExceeded):
+		return errors.New("backup cancelled")
+	default:
+		return fmt.Errorf("save to storage: %w", cause)
 	}
-	return errors.New("backup cancelled due to timeout")
 }
 
 func (uc *CreateMongodbBackupUsecase) buildMongodumpErrorMessage(

@@ -28,6 +28,7 @@ import (
 	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	util_encryption "databasus-backend/internal/util/encryption"
+	io_utils "databasus-backend/internal/util/io"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -75,7 +76,9 @@ func (uc *RestoreMariadbBackupUsecase) Execute(
 	// "Maximum writeset size exceeded" errors on large restores.
 	// wsrep_on is available in MariaDB 10.1+ (all builds with Galera support).
 	// On non-Galera instances the variable still exists but is a no-op.
-	if mdb.Version != tools.MariadbVersion55 {
+	// Setting it requires the SUPER privilege, so it is skippable for managed
+	// clusters that deny SUPER (at the risk of writeset-size errors on big restores).
+	if mdb.Version != tools.MariadbVersion55 && !mdb.IsSkipGaleraDisable {
 		args = append(args, "--init-command=SET SESSION wsrep_on=OFF")
 	}
 
@@ -200,7 +203,8 @@ func (uc *RestoreMariadbBackupUsecase) executeMariadbRestore(
 	}
 	defer zstdReader.Close()
 
-	cmd.Stdin = zstdReader
+	backupStreamReader := io_utils.NewFailureTrackingReader(zstdReader)
+	cmd.Stdin = backupStreamReader
 
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
@@ -238,6 +242,10 @@ func (uc *RestoreMariadbBackupUsecase) executeMariadbRestore(
 
 	if config.IsShouldShutdown() {
 		return fmt.Errorf("restore cancelled due to shutdown")
+	}
+
+	if streamErr := restores_core.GetBackupStreamFailure(backupStreamReader); streamErr != nil {
+		return streamErr
 	}
 
 	if waitErr != nil {

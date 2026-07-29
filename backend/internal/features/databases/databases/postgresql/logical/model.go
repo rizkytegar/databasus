@@ -16,6 +16,7 @@ import (
 
 	postgresql_shared "databasus-backend/internal/features/databases/databases/postgresql/shared"
 	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -39,11 +40,12 @@ type PostgresqlLogicalDatabase struct {
 	SslRootCert   string                            `json:"sslRootCert"   gorm:"column:ssl_root_cert;type:text;not null;default:''"`
 
 	// backup settings
-	IncludeSchemas       []string `json:"includeSchemas" gorm:"-"`
-	IncludeSchemasString string   `json:"-"              gorm:"column:include_schemas;type:text;not null;default:''"`
-	ExcludeTables        []string `json:"excludeTables"  gorm:"-"`
-	ExcludeTablesString  string   `json:"-"              gorm:"column:exclude_tables;type:text;not null;default:''"`
-	CpuCount             int      `json:"cpuCount"       gorm:"column:cpu_count;type:int;not null;default:1"`
+	IncludeSchemas       []string `json:"includeSchemas"     gorm:"-"`
+	IncludeSchemasString string   `json:"-"                  gorm:"column:include_schemas;type:text;not null;default:''"`
+	ExcludeTables        []string `json:"excludeTables"      gorm:"-"`
+	ExcludeTablesString  string   `json:"-"                  gorm:"column:exclude_tables;type:text;not null;default:''"`
+	CpuCount             int      `json:"cpuCount"           gorm:"column:cpu_count;type:int;not null;default:1"`
+	IsSkipUserMappings   bool     `json:"isSkipUserMappings" gorm:"column:is_skip_user_mappings;type:bool;not null;default:false"`
 
 	// restore settings (not saved to DB)
 	IsExcludeExtensions bool `json:"isExcludeExtensions" gorm:"-"`
@@ -56,33 +58,15 @@ func (p *PostgresqlLogicalDatabase) TableName() string {
 }
 
 func (p *PostgresqlLogicalDatabase) BeforeSave(_ *gorm.DB) error {
-	if len(p.IncludeSchemas) > 0 {
-		p.IncludeSchemasString = strings.Join(p.IncludeSchemas, ",")
-	} else {
-		p.IncludeSchemasString = ""
-	}
-
-	if len(p.ExcludeTables) > 0 {
-		p.ExcludeTablesString = strings.Join(p.ExcludeTables, ",")
-	} else {
-		p.ExcludeTablesString = ""
-	}
+	p.IncludeSchemasString = namelist.FormatUniqueNames(p.IncludeSchemas)
+	p.ExcludeTablesString = namelist.FormatUniqueNames(p.ExcludeTables)
 
 	return nil
 }
 
 func (p *PostgresqlLogicalDatabase) AfterFind(_ *gorm.DB) error {
-	if p.IncludeSchemasString != "" {
-		p.IncludeSchemas = strings.Split(p.IncludeSchemasString, ",")
-	} else {
-		p.IncludeSchemas = []string{}
-	}
-
-	if p.ExcludeTablesString != "" {
-		p.ExcludeTables = strings.Split(p.ExcludeTablesString, ",")
-	} else {
-		p.ExcludeTables = []string{}
-	}
+	p.IncludeSchemas = namelist.ParseUniqueNames(p.IncludeSchemasString)
+	p.ExcludeTables = namelist.ParseUniqueNames(p.ExcludeTablesString)
 
 	return nil
 }
@@ -165,8 +149,8 @@ func (p *PostgresqlLogicalDatabase) TestConnection(
 	return testSingleDatabaseConnection(logger, ctx, p, encryptor)
 }
 
-// GetRawDbSizeMb returns whole-database size via pg_database_size; when
-// IncludeSchemas filters the dump, the value remains the full DB size.
+// The value feeds verification disk planning and the restored-size sanity check,
+// so it must cover exactly the relations pg_dump emits for this database.
 func (p *PostgresqlLogicalDatabase) GetRawDbSizeMb(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -186,9 +170,12 @@ func (p *PostgresqlLogicalDatabase) GetRawDbSizeMb(
 		}
 	}()
 
-	var sizeBytes int64
-	if err := conn.QueryRow(ctx, "SELECT pg_database_size(current_database())").Scan(&sizeBytes); err != nil {
-		return 0, fmt.Errorf("failed to query pg_database_size: %w", err)
+	sizeBytes, err := getDumpedRelationsSizeBytes(ctx, conn, DumpFilter{
+		IncludeSchemas:       p.IncludeSchemas,
+		ExcludeTablePatterns: p.ExcludeTables,
+	})
+	if err != nil {
+		return 0, err
 	}
 
 	return float64(sizeBytes) / (1024 * 1024), nil
@@ -219,6 +206,7 @@ func (p *PostgresqlLogicalDatabase) Update(incoming *PostgresqlLogicalDatabase) 
 	p.IncludeSchemas = incoming.IncludeSchemas
 	p.ExcludeTables = incoming.ExcludeTables
 	p.CpuCount = incoming.CpuCount
+	p.IsSkipUserMappings = incoming.IsSkipUserMappings
 
 	if incoming.Password != "" {
 		p.Password = incoming.Password
@@ -947,6 +935,36 @@ func testSingleDatabaseConnection(
 	// Verify user has sufficient permissions for backup operations
 	if err := checkBackupPermissions(ctx, conn, postgresDb.IncludeSchemas); err != nil {
 		return err
+	}
+
+	if !postgresDb.IsSkipUserMappings {
+		if err := checkUserMappingsReadable(ctx, conn); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// PostgreSQL masks pg_user_mappings.umoptions (credentials) from any role that is not a superuser,
+// the foreign server owner, or the mapping's own user. Such a role's pg_dump emits a bare CREATE
+// USER MAPPING that loses the credentials and breaks restore for FDWs that require them (e.g.
+// oracle_fdw), so refuse the backup when any mapping's options are hidden.
+func checkUserMappingsReadable(ctx context.Context, conn *pgx.Conn) error {
+	var unreadableCount int
+	err := conn.QueryRow(ctx, "SELECT count(*) FROM pg_user_mappings WHERE umoptions IS NULL").
+		Scan(&unreadableCount)
+	if err != nil {
+		return fmt.Errorf("cannot check user mapping options: %w", err)
+	}
+
+	if unreadableCount > 0 {
+		return fmt.Errorf(
+			"database has %d user mapping(s) whose options this role cannot read; their "+
+				"credentials would be lost on restore — back up as a superuser or the foreign "+
+				"server/mapping owner, or enable 'skip user mappings'",
+			unreadableCount,
+		)
 	}
 
 	return nil

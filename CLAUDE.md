@@ -17,6 +17,8 @@ This root file holds the engineering philosophy that applies everywhere.
 
 Work happens inside the repo's [Dev Container](.devcontainer/devcontainer.json). The container ships Go, Node.js + pnpm, Docker-in-Docker, linters and matching VS Code extensions, so the toolchain is identical for every contributor. Ports `4005` (backend) and `5173` (Vite) are forwarded automatically. Don't install or rely on host-level SDKs — run `make`, `pnpm` and `docker` commands from inside the container.
 
+Running the backend suite host-native is supported on Fedora via `make test-fedora`, which shims the Debian soname the bundled `assets/tools` clients expect. Any other host distro is on its own — the container stays the reference environment. Also project sometimes is run in different worktrees, in this case it is needed to copy .env.example -> .env, `make swagger` and `pnpm install` to run tests
+
 ---
 
 ## Language in code
@@ -48,6 +50,15 @@ Work happens inside the repo's [Dev Container](.devcontainer/devcontainer.json).
 ### After each run: suggest refactorings
 
 Reread the diff with fresh eyes and **list** (don't silently apply) refactor suggestions: unclear names, duplication, dead code, deep nesting, misplaced responsibilities, leaky abstractions. Keep suggestions concrete (file + lines), behavior-preserving, and scoped to the current change. If the diff is already clean, say so in one line.
+
+### Mandatory compliance review
+
+Every non-trivial change is audited twice by the [`claude-md-reviewer`](.claude/agents/claude-md-reviewer.md) subagent — against this document **and** the module doc for each area it touches (`backend/CLAUDE.md`, `agent/verification/CLAUDE.md`, `frontend/CLAUDE.md`). The module docs add stack-specific rules on top of this one; they never replace it, so a change under `backend/` answers to both.
+
+1. **After planning, before writing code** — it checks the proposed names, file placement, and any planned backward-compat shims while they're still cheap to change.
+2. **After implementing, before finishing the turn** — it checks the working-tree diff and runs the linter for each directory the diff touches.
+
+The reviewer is read-only: it reports findings, you apply the fixes. Resolve every `CHANGES REQUIRED` finding before moving on. Hooks in [`.claude/settings.json`](.claude/settings.json) prompt for both checkpoints, but the obligation is this rule, not the hook — honour it if hooks are disabled.
 
 ### Naming
 
@@ -114,6 +125,10 @@ func (h *Heartbeater) IsAborted(id uuid.UUID) bool { ... }
 After each change run linting and formatting depending on folder you are working it.
 - backend and agent has `make lint` commands
 - frontend has `pnpm lint` and `pnpm format` commands
+
+### Comments are a last resort
+
+The default is **no comment**. Before writing one, reach for a clearer name or a smaller function first — self-explanatory code beats commented code every time. A comment is justified only when it carries something the code cannot: a *why* (business rule, hidden cross-system constraint, non-obvious algorithm or optimisation, ADR reference). Never write a comment that restates *what* the code does or narrates the obvious — if a `// Foo does X` comment sits above the code, that's a naming bug: rename until the comment is redundant, then delete it. This applies everywhere, tests included — a well-named test needs no header comment explaining what it checks.
 
 ### No "how it was" comments, no unrequested backward compatibility
 

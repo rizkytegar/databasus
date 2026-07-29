@@ -13,14 +13,17 @@ import (
 
 	"github.com/google/uuid"
 
+	notifier_models "databasus-backend/internal/features/notifiers/models"
 	"databasus-backend/internal/util/encryption"
 )
 
 type TelegramNotifier struct {
-	NotifierID   uuid.UUID `json:"notifierId"   gorm:"primaryKey;column:notifier_id"`
-	BotToken     string    `json:"botToken"     gorm:"not null;column:bot_token"`
-	TargetChatID string    `json:"targetChatId" gorm:"not null;column:target_chat_id"`
-	ThreadID     *int64    `json:"threadId"     gorm:"column:thread_id"`
+	NotifierID     uuid.UUID `json:"notifierId"     gorm:"primaryKey;column:notifier_id"`
+	BotToken       string    `json:"botToken"       gorm:"not null;column:bot_token"`
+	TargetChatID   string    `json:"targetChatId"   gorm:"not null;column:target_chat_id"`
+	ThreadID       *int64    `json:"threadId"       gorm:"column:thread_id"`
+	IsProxyEnabled bool      `json:"isProxyEnabled" gorm:"column:is_proxy_enabled;type:boolean;not null;default:false"`
+	ProxyURL       string    `json:"proxyUrl"       gorm:"column:proxy_url;type:text"`
 }
 
 func (t *TelegramNotifier) TableName() string {
@@ -36,23 +39,37 @@ func (t *TelegramNotifier) Validate(encryptor encryption.FieldEncryptor) error {
 		return errors.New("target chat ID is required")
 	}
 
+	if t.IsProxyEnabled {
+		if t.ProxyURL == "" {
+			return errors.New("proxy URL is required")
+		}
+
+		proxyURL, err := encryptor.Decrypt(t.ProxyURL)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt proxy URL: %w", err)
+		}
+
+		if _, err := parseProxyURL(proxyURL); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func (t *TelegramNotifier) Send(
 	encryptor encryption.FieldEncryptor,
 	logger *slog.Logger,
-	heading string,
-	message string,
+	notification notifier_models.Notification,
 ) error {
 	botToken, err := encryptor.Decrypt(t.BotToken)
 	if err != nil {
 		return fmt.Errorf("failed to decrypt bot token: %w", err)
 	}
 
-	fullMessage := heading
-	if message != "" {
-		fullMessage = fmt.Sprintf("%s\n\n%s", heading, message)
+	fullMessage := notification.Heading
+	if notification.Message != "" {
+		fullMessage = fmt.Sprintf("%s\n\n%s", notification.Heading, notification.Message)
 	}
 
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
@@ -73,7 +90,11 @@ func (t *TelegramNotifier) Send(
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{}
+	client, err := t.buildHTTPClient(encryptor)
+	if err != nil {
+		return err
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send telegram message: %w", err)
@@ -96,11 +117,19 @@ func (t *TelegramNotifier) Send(
 
 func (t *TelegramNotifier) HideSensitiveData() {
 	t.BotToken = ""
+	t.ProxyURL = ""
 }
 
 func (t *TelegramNotifier) Update(incoming *TelegramNotifier) {
 	t.TargetChatID = incoming.TargetChatID
 	t.ThreadID = incoming.ThreadID
+	t.IsProxyEnabled = incoming.IsProxyEnabled
+
+	if !incoming.IsProxyEnabled {
+		t.ProxyURL = ""
+	} else if incoming.ProxyURL != "" {
+		t.ProxyURL = incoming.ProxyURL
+	}
 
 	if incoming.BotToken != "" {
 		t.BotToken = incoming.BotToken
@@ -115,5 +144,16 @@ func (t *TelegramNotifier) EncryptSensitiveData(encryptor encryption.FieldEncryp
 		}
 		t.BotToken = encrypted
 	}
+
+	if !t.IsProxyEnabled {
+		t.ProxyURL = ""
+	} else if t.ProxyURL != "" {
+		encrypted, err := encryptor.Encrypt(t.ProxyURL)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt proxy URL: %w", err)
+		}
+		t.ProxyURL = encrypted
+	}
+
 	return nil
 }

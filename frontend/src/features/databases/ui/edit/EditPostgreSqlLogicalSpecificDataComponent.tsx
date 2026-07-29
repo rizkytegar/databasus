@@ -9,6 +9,7 @@ import {
   databaseApi,
 } from '../../../../entity/databases';
 import { ConnectionStringParser } from '../../../../entity/databases/model/postgresql/ConnectionStringParser';
+import { NAME_LIST_TOKEN_SEPARATORS, normalizeNameList } from '../../../../shared/lib';
 import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
 import { ClipboardPasteModalComponent } from '../../../../shared/ui';
@@ -89,7 +90,8 @@ export const EditPostgreSqlLogicalSpecificDataComponent = ({
         !!database.postgresqlLogical?.isRestoreOwnership ||
         !!database.postgresqlLogical?.isRestorePrivileges
       : !!database.postgresqlLogical?.includeSchemas?.length ||
-        !!database.postgresqlLogical?.excludeTables?.length);
+        !!database.postgresqlLogical?.excludeTables?.length ||
+        !!database.postgresqlLogical?.isSkipUserMappings);
   const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
 
   const [hasAutoAddedPublicSchema, setHasAutoAddedPublicSchema] = useState(false);
@@ -644,14 +646,14 @@ export const EditPostgreSqlLogicalSpecificDataComponent = ({
                       ...editingDatabase,
                       postgresqlLogical: {
                         ...editingDatabase.postgresqlLogical,
-                        includeSchemas: values,
+                        includeSchemas: normalizeNameList(values),
                       },
                     });
                   }}
                   size="small"
                   className="max-w-[200px] grow"
                   placeholder="All schemas (default)"
-                  tokenSeparators={[',']}
+                  tokenSeparators={NAME_LIST_TOKEN_SEPARATORS}
                 />
               </div>
             )}
@@ -669,22 +671,50 @@ export const EditPostgreSqlLogicalSpecificDataComponent = ({
                       ...editingDatabase,
                       postgresqlLogical: {
                         ...editingDatabase.postgresqlLogical,
-                        excludeTables: values,
+                        excludeTables: normalizeNameList(values),
                       },
                     });
                   }}
                   size="small"
                   className="max-w-[200px] grow"
                   placeholder="No tables excluded"
-                  tokenSeparators={[',']}
+                  tokenSeparators={NAME_LIST_TOKEN_SEPARATORS}
                 />
 
                 <Tooltip
                   className="cursor-pointer"
-                  title="Tables to exclude from the backup. Use 'tablename' or 'schema.tablename'. Glob patterns are supported (e.g. 'logs_*')."
+                  title="Tables to exclude from the backup. Use 'tablename' or 'schema.tablename'. Glob patterns are supported (e.g. 'logs_*'). You can paste a list separated by commas or new lines."
                 >
                   <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
                 </Tooltip>
+              </div>
+            )}
+
+            {!isRestoreMode && (
+              <div className="mb-1 flex w-full items-center">
+                <div className="flex min-w-[150px] items-center">
+                  <span>Skip user mappings</span>
+                  <Tooltip
+                    className="cursor-pointer"
+                    title="Skip restoring user mappings (CREATE USER MAPPING statements). Enable this when the backup role cannot read the mapping credentials - otherwise they are dumped without options and break restore for FDWs like oracle_fdw."
+                  >
+                    <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+                  </Tooltip>
+                </div>
+                <Checkbox
+                  checked={editingDatabase.postgresqlLogical?.isSkipUserMappings || false}
+                  onChange={(e) => {
+                    if (!editingDatabase.postgresqlLogical) return;
+
+                    setEditingDatabase({
+                      ...editingDatabase,
+                      postgresqlLogical: {
+                        ...editingDatabase.postgresqlLogical,
+                        isSkipUserMappings: e.target.checked,
+                      },
+                    });
+                  }}
+                />
               </div>
             )}
 

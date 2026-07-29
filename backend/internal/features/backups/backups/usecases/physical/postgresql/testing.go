@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -711,36 +712,56 @@ func CountCommittedWalSegments(t *testing.T, databaseID uuid.UUID) int64 {
 	return count
 }
 
-// StartWalStreamerForTest runs a WalStreamSupervisor against the fixture's
-// source PG in a goroutine, archiving rotated segments into store, and returns a
-// stop func that cancels and waits for a clean drain (so pg_receivewal releases
-// the slot before the DB and its slot are torn down). Cross-package backup→
-// restore tests pass the real fixture.Storage so archived segments can be read
-// back and replayed.
-func StartWalStreamerForTest(t *testing.T, fixture *PhysicalDBFixture, store storages.StorageFileSaver) func() {
+// WalStreamerForTest exposes the watch dir so a test can restart a streamer
+// against the queue an earlier run left behind.
+type WalStreamerForTest struct {
+	Supervisor *WalStreamSupervisor
+	WatchDir   string
+	Stop       func()
+}
+
+type WalStreamerTestSpec struct {
+	Fixture                   *PhysicalDBFixture
+	Storage                   storages.StorageFileSaver
+	WatchDirRoot              string
+	WalLagThresholdBytes      int64
+	ForcedRotationInterval    time.Duration
+	ArchiveStalenessThreshold time.Duration
+	OnSlotRebuilt             func(ctx context.Context, reason string) error
+	OnChainAtRisk             func(report ChainRiskReport)
+}
+
+// A replication slot is meant to outlive a streamer restart (so WAL is never
+// lost), so the supervisor deliberately does NOT drop it on shutdown. In tests
+// that would leak one slot per run until max_replication_slots is exhausted, so
+// drop this streamer's slot here. Registered before the caller's stop cleanup,
+// it runs (LIFO) right after the streamer has stopped and before the conn closes.
+func StartWalStreamerForTest(t *testing.T, spec WalStreamerTestSpec) *WalStreamerForTest {
 	t.Helper()
 
-	// A replication slot is meant to outlive a streamer restart (so WAL is never
-	// lost), so the supervisor deliberately does NOT drop it on shutdown. In tests
-	// that would leak one slot per run until max_replication_slots is exhausted, so
-	// drop this streamer's slot here. Registered before the caller's stop cleanup,
-	// it runs (LIFO) right after the streamer has stopped and before the conn closes.
+	fixture := spec.Fixture
+
 	adminConn := OpenAdminConn(t, fixture)
 	t.Cleanup(func() {
 		DropReplicationSlotExternally(t, adminConn, fixture.DB.PostgresqlPhysical.ReplicationSlotName)
 	})
 
 	supervisor := NewWalStreamSupervisor(WalStreamSpec{
-		DatabaseID:     fixture.DB.ID,
-		SourceDB:       fixture.DB.PostgresqlPhysical,
-		StorageID:      fixture.Storage.ID,
-		Storage:        store,
-		Encryption:     backups_core_enums.BackupEncryptionNone,
-		FieldEncryptor: encryption.GetFieldEncryptor(),
-		WalSegmentRepo: physical_repositories.GetWalSegmentRepository(),
-		HistoryRepo:    physical_repositories.GetWalHistoryRepository(),
-		WatchDirRoot:   t.TempDir(),
-		Logger:         logger.GetLogger(),
+		DatabaseID:                fixture.DB.ID,
+		SourceDB:                  fixture.DB.PostgresqlPhysical,
+		StorageID:                 fixture.Storage.ID,
+		Storage:                   spec.Storage,
+		Encryption:                backups_core_enums.BackupEncryptionNone,
+		FieldEncryptor:            encryption.GetFieldEncryptor(),
+		WalSegmentRepo:            physical_repositories.GetWalSegmentRepository(),
+		HistoryRepo:               physical_repositories.GetWalHistoryRepository(),
+		WatchDirRoot:              spec.WatchDirRoot,
+		WalLagThresholdBytes:      spec.WalLagThresholdBytes,
+		ForcedRotationInterval:    spec.ForcedRotationInterval,
+		ArchiveStalenessThreshold: spec.ArchiveStalenessThreshold,
+		OnSlotRebuilt:             spec.OnSlotRebuilt,
+		OnChainAtRisk:             spec.OnChainAtRisk,
+		Logger:                    logger.GetLogger(),
 	})
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -752,21 +773,23 @@ func StartWalStreamerForTest(t *testing.T, fixture *PhysicalDBFixture, store sto
 		_ = supervisor.Run(ctx)
 	}()
 
-	return func() {
-		cancel()
+	return &WalStreamerForTest{
+		Supervisor: supervisor,
+		WatchDir:   filepath.Join(spec.WatchDirRoot, "wal-queue", fixture.DB.ID.String()),
+		Stop: func() {
+			cancel()
 
-		select {
-		case <-done:
-		case <-time.After(30 * time.Second):
-			t.Log("streamer did not stop within timeout")
-		}
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Log("streamer did not stop within timeout")
+			}
+		},
 	}
 }
 
-// MarkFullCompleted promotes the fixture's IN_PROGRESS FULL to COMPLETED with the
-// given LSN bounds, so chain_view treats it as a real chain anchor whose span
-// (GetChainSpan / FindWalGapsInChain) covers the streamed WAL segments. Streamer
-// tests that assert on chain shape need a COMPLETED FULL to anchor against.
+// chain_view only treats a COMPLETED FULL as a chain anchor, so streamer tests
+// that assert on chain shape need one to anchor against.
 func MarkFullCompleted(t *testing.T, fullID uuid.UUID, timelineID int, startLSN, stopLSN walmath.LSN) {
 	t.Helper()
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 )
@@ -61,6 +62,11 @@ func (s *WalStreamSupervisor) rebuildSlot(ctx context.Context, logger *slog.Logg
 		return fmt.Errorf("recreate slot: %w", err)
 	}
 
+	// The new slot reserves from the cluster's current WAL position, so the queue
+	// we just stopped writing to now sits below it and would drag pg_receivewal's
+	// resume point into recycled WAL.
+	s.realignResumePath(ctx, logger)
+
 	if s.spec.OnSlotRebuilt != nil {
 		if err := s.spec.OnSlotRebuilt(ctx, string(reason)); err != nil {
 			return fmt.Errorf("request full after slot rebuild: %w", err)
@@ -72,8 +78,6 @@ func (s *WalStreamSupervisor) rebuildSlot(ctx context.Context, logger *slog.Logg
 	return nil
 }
 
-// isOwnedReceiverBackend reports whether an active slot is held by one of our own
-// pg_receivewal processes — its PGAPPNAME carries receivewalApplicationNamePrefix.
 // A slot held by anything else (a third-party consumer, or a backend we cannot
 // attribute) must never be force-terminated or dropped during a rebuild.
 func isOwnedReceiverBackend(state *SlotState) bool {
@@ -170,4 +174,11 @@ func (s *WalStreamSupervisor) recordRebuildAttemptWithinCap() bool {
 	s.rebuildTimestamps = append(s.rebuildTimestamps, now)
 
 	return true
+}
+
+func (s *WalStreamSupervisor) GetSlotRebuildTimestamps() []time.Time {
+	s.rebuildMu.Lock()
+	defer s.rebuildMu.Unlock()
+
+	return slices.Clone(s.rebuildTimestamps)
 }

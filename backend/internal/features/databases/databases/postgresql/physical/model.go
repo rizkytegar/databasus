@@ -219,6 +219,20 @@ func (p *PostgresqlPhysicalDatabase) PopulateDbData(
 	return nil
 }
 
+// ParentDatabaseID returns the parent databases.id this physical record hangs
+// off — the target of every physical catalog FK (fk_physical_wal_*_database_id,
+// fk_physical_full_backups_database_id, …), never the
+// postgresql_physical_databases PK. The fallback to ID covers an unassociated
+// in-memory row whose DatabaseID was not loaded, mirroring
+// receivewalApplicationName's fallback.
+func (p *PostgresqlPhysicalDatabase) ParentDatabaseID() uuid.UUID {
+	if p.DatabaseID != nil {
+		return *p.DatabaseID
+	}
+
+	return p.ID
+}
+
 func (p *PostgresqlPhysicalDatabase) SystemIdentifierUint64() uint64 {
 	if p.SystemIdentifier == nil {
 		return 0
@@ -992,7 +1006,7 @@ func readReplicationSettings(ctx context.Context, conn *pgx.Conn) (*replicationS
 	if err := conn.QueryRow(ctx, `
 		SELECT
 			(SELECT setting FROM pg_settings WHERE name = 'wal_level'),
-			(SELECT setting FROM pg_settings WHERE name = 'summarize_wal'),
+			COALESCE((SELECT setting FROM pg_settings WHERE name = 'summarize_wal'), 'off'),
 			(SELECT setting::int FROM pg_settings WHERE name = 'max_wal_senders'),
 			(SELECT setting::int FROM pg_settings WHERE name = 'max_replication_slots')
 	`).Scan(

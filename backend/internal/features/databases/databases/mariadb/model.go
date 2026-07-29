@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 
 	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -26,16 +27,18 @@ type MariadbDatabase struct {
 
 	Version tools.MariadbVersion `json:"version" gorm:"type:text;not null"`
 
-	Host                string   `json:"host"            gorm:"type:text;not null"`
-	Port                int      `json:"port"            gorm:"type:int;not null"`
-	Username            string   `json:"username"        gorm:"type:text;not null"`
-	Password            string   `json:"password"        gorm:"type:text;not null"`
-	Database            *string  `json:"database"        gorm:"type:text"`
-	IsHttps             bool     `json:"isHttps"         gorm:"type:boolean;default:false"`
-	IsExcludeEvents     bool     `json:"isExcludeEvents" gorm:"type:boolean;default:false"`
-	ExcludeTables       []string `json:"excludeTables"   gorm:"-"`
-	ExcludeTablesString string   `json:"-"               gorm:"column:exclude_tables;type:text;not null;default:''"`
-	Privileges          string   `json:"privileges"      gorm:"column:privileges;type:text;not null;default:''"`
+	Host                string   `json:"host"                gorm:"type:text;not null"`
+	Port                int      `json:"port"                gorm:"type:int;not null"`
+	Username            string   `json:"username"            gorm:"type:text;not null"`
+	Password            string   `json:"password"            gorm:"type:text;not null"`
+	Database            *string  `json:"database"            gorm:"type:text"`
+	IsHttps             bool     `json:"isHttps"             gorm:"type:boolean;default:false"`
+	IsExcludeEvents     bool     `json:"isExcludeEvents"     gorm:"type:boolean;default:false"`
+	IsUseExtendedInsert bool     `json:"isUseExtendedInsert" gorm:"column:is_use_extended_insert;type:boolean;not null;default:false"`
+	IsSkipGaleraDisable bool     `json:"isSkipGaleraDisable" gorm:"column:is_skip_galera_disable;type:boolean;not null;default:false"`
+	ExcludeTables       []string `json:"excludeTables"       gorm:"-"`
+	ExcludeTablesString string   `json:"-"                   gorm:"column:exclude_tables;type:text;not null;default:''"`
+	Privileges          string   `json:"privileges"          gorm:"column:privileges;type:text;not null;default:''"`
 }
 
 func (m *MariadbDatabase) TableName() string {
@@ -43,21 +46,13 @@ func (m *MariadbDatabase) TableName() string {
 }
 
 func (m *MariadbDatabase) BeforeSave(_ *gorm.DB) error {
-	if len(m.ExcludeTables) > 0 {
-		m.ExcludeTablesString = strings.Join(m.ExcludeTables, ",")
-	} else {
-		m.ExcludeTablesString = ""
-	}
+	m.ExcludeTablesString = namelist.FormatUniqueNames(m.ExcludeTables)
 
 	return nil
 }
 
 func (m *MariadbDatabase) AfterFind(_ *gorm.DB) error {
-	if m.ExcludeTablesString != "" {
-		m.ExcludeTables = strings.Split(m.ExcludeTablesString, ",")
-	} else {
-		m.ExcludeTables = []string{}
-	}
+	m.ExcludeTables = namelist.ParseUniqueNames(m.ExcludeTablesString)
 
 	return nil
 }
@@ -192,6 +187,8 @@ func (m *MariadbDatabase) Update(incoming *MariadbDatabase) {
 	m.Database = incoming.Database
 	m.IsHttps = incoming.IsHttps
 	m.IsExcludeEvents = incoming.IsExcludeEvents
+	m.IsUseExtendedInsert = incoming.IsUseExtendedInsert
+	m.IsSkipGaleraDisable = incoming.IsSkipGaleraDisable
 	m.ExcludeTables = incoming.ExcludeTables
 	m.Privileges = incoming.Privileges
 

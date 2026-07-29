@@ -26,7 +26,7 @@ import (
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
 	"databasus-backend/internal/features/storages"
 	"databasus-backend/internal/util/encryption"
-	io_utils "databasus-backend/internal/util/io"
+	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -40,6 +40,11 @@ const (
 	exitCodeAccessViolation  = -1073741819
 	exitCodeGenericError     = 1
 	exitCodeConnectionError  = 2
+)
+
+var (
+	errBackupShutdown = errors.New("backup cancelled due to shutdown")
+	errBackupTimeout  = errors.New("backup cancelled due to timeout")
 )
 
 type CreatePostgresqlBackupUsecase struct {
@@ -134,7 +139,7 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	uc.logger.Info("Streaming PostgreSQL backup to storage", "pgBin", pgBin, "args", args)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
-	defer cancel()
+	defer cancel(nil)
 
 	credentials, err := postgresql_shared.WriteCredentialFilesToTempDir(
 		db.PostgresqlLogical.CredentialSpec(), password, uc.fieldEncryptor)
@@ -185,11 +190,6 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	countingWriter := io_utils.NewCountingWriter(finalWriter)
-
-	// The backup ID becomes the object key / filename in storage
-
-	// Start streaming into storage in its own goroutine
 	saveErrCh := make(chan error, 1)
 	go func() {
 		saveErr := storage.SaveFile(
@@ -201,23 +201,21 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 		)
 		if saveErr != nil {
 			_ = storageReader.CloseWithError(saveErr)
-			cancel()
+			cancel(saveErr)
 		}
 		saveErrCh <- saveErr
 	}()
 
-	// Start pg_dump
 	if err = cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(pgBin), err)
 	}
 
-	// Copy pg output directly to storage with shutdown checks
 	copyResultCh := make(chan error, 1)
 	bytesWrittenCh := make(chan int64, 1)
 	go func() {
 		bytesWritten, err := uc.copyWithShutdownCheck(
 			ctx,
-			countingWriter,
+			finalWriter,
 			pgStdout,
 			backupProgressListener,
 		)
@@ -242,7 +240,7 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	select {
 	case <-ctx.Done():
 		uc.cleanupOnCancellation(encryptionWriter, storageWriter, saveErrCh)
-		return nil, uc.checkCancellationReason()
+		return nil, uc.classifyCancellation(ctx)
 	default:
 	}
 
@@ -369,12 +367,12 @@ func (uc *CreatePostgresqlBackupUsecase) buildPgDumpArgs(pg *pgtypes.PostgresqlL
 		"--verbose",
 	}
 
-	for _, schema := range pg.IncludeSchemas {
-		args = append(args, "-n", schema)
+	for _, includedSchema := range namelist.NormalizeUniqueNames(pg.IncludeSchemas) {
+		args = append(args, "-n", includedSchema)
 	}
 
-	for _, table := range pg.ExcludeTables {
-		args = append(args, "--exclude-table="+table)
+	for _, excludedTable := range namelist.NormalizeUniqueNames(pg.ExcludeTables) {
+		args = append(args, "--exclude-table="+excludedTable)
 	}
 
 	compressionArgs := uc.getCompressionArgs(pg.Version)
@@ -404,10 +402,14 @@ func (uc *CreatePostgresqlBackupUsecase) isOlderPostgresVersion(
 
 func (uc *CreatePostgresqlBackupUsecase) createBackupContext(
 	parentCtx context.Context,
-) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(parentCtx, backupTimeout)
+) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(parentCtx)
+
+	timeout := time.AfterFunc(backupTimeout, func() { cancel(errBackupTimeout) })
 
 	go func() {
+		defer timeout.Stop()
+
 		ticker := time.NewTicker(shutdownCheckInterval)
 		defer ticker.Stop()
 
@@ -416,11 +418,11 @@ func (uc *CreatePostgresqlBackupUsecase) createBackupContext(
 			case <-ctx.Done():
 				return
 			case <-parentCtx.Done():
-				cancel()
+				cancel(context.Cause(parentCtx))
 				return
 			case <-ticker.C:
 				if config.IsShouldShutdown() {
-					cancel()
+					cancel(errBackupShutdown)
 					return
 				}
 			}
@@ -567,22 +569,26 @@ func (uc *CreatePostgresqlBackupUsecase) closeWriters(
 }
 
 func (uc *CreatePostgresqlBackupUsecase) checkCancellation(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		if config.IsShouldShutdown() {
-			return fmt.Errorf("backup cancelled due to shutdown")
-		}
-		return fmt.Errorf("backup cancelled")
-	default:
+	if ctx.Err() == nil {
 		return nil
 	}
+
+	return uc.classifyCancellation(ctx)
 }
 
-func (uc *CreatePostgresqlBackupUsecase) checkCancellationReason() error {
-	if config.IsShouldShutdown() {
-		return fmt.Errorf("backup cancelled due to shutdown")
+func (uc *CreatePostgresqlBackupUsecase) classifyCancellation(ctx context.Context) error {
+	cause := context.Cause(ctx)
+
+	switch {
+	case errors.Is(cause, errBackupShutdown):
+		return errors.New("backup cancelled due to shutdown")
+	case errors.Is(cause, errBackupTimeout):
+		return errors.New("backup cancelled due to timeout")
+	case cause == nil, errors.Is(cause, context.Canceled), errors.Is(cause, context.DeadlineExceeded):
+		return errors.New("backup cancelled")
+	default:
+		return fmt.Errorf("save to storage: %w", cause)
 	}
-	return fmt.Errorf("backup cancelled")
 }
 
 func (uc *CreatePostgresqlBackupUsecase) buildPgDumpErrorMessage(

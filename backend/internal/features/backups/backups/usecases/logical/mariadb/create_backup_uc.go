@@ -27,6 +27,7 @@ import (
 	"databasus-backend/internal/features/storages"
 	"databasus-backend/internal/util/encryption"
 	io_utils "databasus-backend/internal/util/io"
+	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -40,6 +41,11 @@ const (
 	exitCodeConnectionError     = 2
 )
 
+var (
+	errBackupShutdown = errors.New("backup cancelled due to shutdown")
+	errBackupTimeout  = errors.New("backup cancelled due to timeout")
+)
+
 type CreateMariadbBackupUsecase struct {
 	logger           *slog.Logger
 	secretKeyService *encryption_secrets.SecretKeyService
@@ -49,6 +55,13 @@ type CreateMariadbBackupUsecase struct {
 type writeResult struct {
 	bytesWritten int
 	writeErr     error
+}
+
+type compressedCopySpec struct {
+	Destination            io.Writer
+	Source                 io.Reader
+	CompressedBytesCounter *io_utils.CountingWriter
+	ProgressListener       func(completedMBs float64)
 }
 
 func (uc *CreateMariadbBackupUsecase) Execute(
@@ -113,9 +126,15 @@ func (uc *CreateMariadbBackupUsecase) buildMariadbDumpArgs(
 		"--single-transaction",
 		"--routines",
 		"--quick",
-		"--skip-extended-insert",
 		"--skip-add-locks",
 		"--verbose",
+	}
+
+	// One INSERT per row caps mariadb-dump memory on huge tables, but bloats the
+	// dump and makes restores far slower. Opting into extended inserts batches
+	// rows (mariadb-dump's default) for fast restores at higher backup memory.
+	if !mdb.IsUseExtendedInsert {
+		args = append(args, "--skip-extended-insert")
 	}
 
 	if mdb.HasPrivilege("TRIGGER") {
@@ -127,12 +146,10 @@ func (uc *CreateMariadbBackupUsecase) buildMariadbDumpArgs(
 	}
 
 	if mdb.Database != nil && *mdb.Database != "" {
-		for _, table := range mdb.ExcludeTables {
-			args = append(args, "--ignore-table="+*mdb.Database+"."+table)
+		for _, excludedTable := range namelist.NormalizeUniqueNames(mdb.ExcludeTables) {
+			args = append(args, "--ignore-table="+*mdb.Database+"."+excludedTable)
 		}
 	}
-
-	args = append(args, "--compress")
 
 	args = append(args, "--max-allowed-packet=1G")
 
@@ -164,7 +181,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	uc.logger.Info("Streaming MariaDB backup to storage", "mariadbBin", mariadbBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
-	defer cancel()
+	defer cancel(nil)
 
 	myCnfFile, err := uc.createTempMyCnfFile(mdbConfig, password)
 	if err != nil {
@@ -172,7 +189,16 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	}
 	defer func() { _ = os.RemoveAll(filepath.Dir(myCnfFile)) }()
 
-	fullArgs := append([]string{"--defaults-file=" + myCnfFile}, args...)
+	compressionArgs := uc.probeNetworkCompressionArgs(ctx, CompressionProbeSpec{
+		MariadbDumpBin: mariadbBin,
+		MyCnfFile:      myCnfFile,
+		DatabaseName:   *mdbConfig.Database,
+		DatabaseID:     backup.DatabaseID,
+		IsHttps:        mdbConfig.IsHttps,
+	})
+
+	fullArgs := append([]string{"--defaults-file=" + myCnfFile}, compressionArgs...)
+	fullArgs = append(fullArgs, args...)
 
 	cmd := exec.CommandContext(ctx, mariadbBin, fullArgs...)
 	uc.logger.Info("Executing MariaDB backup command", "command", cmd.String())
@@ -211,12 +237,13 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	zstdWriter, err := zstd.NewWriter(finalWriter,
+	compressedBytesCounter := io_utils.NewCountingWriter(finalWriter)
+
+	zstdWriter, err := zstd.NewWriter(compressedBytesCounter,
 		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(zstdStorageCompressionLevel)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd writer: %w", err)
 	}
-	countingWriter := io_utils.NewCountingWriter(zstdWriter)
 
 	saveErrCh := make(chan error, 1)
 	go func() {
@@ -229,7 +256,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 		)
 		if saveErr != nil {
 			_ = storageReader.CloseWithError(saveErr)
-			cancel()
+			cancel(saveErr)
 		}
 		saveErrCh <- saveErr
 	}()
@@ -239,20 +266,16 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	}
 
 	copyResultCh := make(chan error, 1)
-	bytesWrittenCh := make(chan int64, 1)
 	go func() {
-		bytesWritten, err := uc.copyWithShutdownCheck(
-			ctx,
-			countingWriter,
-			pgStdout,
-			backupProgressListener,
-		)
-		bytesWrittenCh <- bytesWritten
-		copyResultCh <- err
+		copyResultCh <- uc.copyWithShutdownCheck(ctx, compressedCopySpec{
+			Destination:            zstdWriter,
+			Source:                 pgStdout,
+			CompressedBytesCounter: compressedBytesCounter,
+			ProgressListener:       backupProgressListener,
+		})
 	}()
 
 	copyErr := <-copyResultCh
-	bytesWritten := <-bytesWrittenCh
 	waitErr := cmd.Wait()
 
 	select {
@@ -269,7 +292,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	select {
 	case <-ctx.Done():
 		uc.cleanupOnCancellation(zstdWriter, encryptionWriter, storageWriter, saveErrCh)
-		return nil, uc.checkCancellationReason()
+		return nil, uc.classifyCancellation(ctx)
 	default:
 	}
 
@@ -285,8 +308,8 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	stderrOutput := <-stderrCh
 
 	if waitErr == nil && copyErr == nil && saveErr == nil && backupProgressListener != nil {
-		sizeMB := float64(bytesWritten) / (1024 * 1024)
-		backupProgressListener(sizeMB)
+		compressedSizeMB := float64(compressedBytesCounter.GetBytesWritten()) / (1024 * 1024)
+		backupProgressListener(compressedSizeMB)
 	}
 
 	switch {
@@ -343,30 +366,27 @@ port=%d
 
 func (uc *CreateMariadbBackupUsecase) copyWithShutdownCheck(
 	ctx context.Context,
-	dst io.Writer,
-	src io.Reader,
-	backupProgressListener func(completedMBs float64),
-) (int64, error) {
+	copySpec compressedCopySpec,
+) error {
 	buf := make([]byte, copyBufferSize)
-	var totalBytesWritten int64
 	var lastReportedMB float64
 
 	for {
 		select {
 		case <-ctx.Done():
-			return totalBytesWritten, fmt.Errorf("copy cancelled: %w", ctx.Err())
+			return fmt.Errorf("copy cancelled: %w", ctx.Err())
 		default:
 		}
 
 		if config.IsShouldShutdown() {
-			return totalBytesWritten, fmt.Errorf("copy cancelled due to shutdown")
+			return fmt.Errorf("copy cancelled due to shutdown")
 		}
 
-		bytesRead, readErr := src.Read(buf)
+		bytesRead, readErr := copySpec.Source.Read(buf)
 		if bytesRead > 0 {
 			writeResultCh := make(chan writeResult, 1)
 			go func() {
-				bytesWritten, writeErr := dst.Write(buf[0:bytesRead])
+				bytesWritten, writeErr := copySpec.Destination.Write(buf[0:bytesRead])
 				writeResultCh <- writeResult{bytesWritten, writeErr}
 			}()
 
@@ -375,7 +395,7 @@ func (uc *CreateMariadbBackupUsecase) copyWithShutdownCheck(
 
 			select {
 			case <-ctx.Done():
-				return totalBytesWritten, fmt.Errorf("copy cancelled during write: %w", ctx.Err())
+				return fmt.Errorf("copy cancelled during write: %w", ctx.Err())
 			case result := <-writeResultCh:
 				bytesWritten = result.bytesWritten
 				writeErr = result.writeErr
@@ -389,41 +409,45 @@ func (uc *CreateMariadbBackupUsecase) copyWithShutdownCheck(
 			}
 
 			if writeErr != nil {
-				return totalBytesWritten, writeErr
+				return writeErr
 			}
 
 			if bytesRead != bytesWritten {
-				return totalBytesWritten, io.ErrShortWrite
+				return io.ErrShortWrite
 			}
 
-			totalBytesWritten += int64(bytesWritten)
-
-			if backupProgressListener != nil {
-				currentSizeMB := float64(totalBytesWritten) / (1024 * 1024)
-				if currentSizeMB >= lastReportedMB+progressReportIntervalMB {
-					backupProgressListener(currentSizeMB)
-					lastReportedMB = currentSizeMB
+			if copySpec.ProgressListener != nil {
+				compressedSizeMB := float64(
+					copySpec.CompressedBytesCounter.GetBytesWritten(),
+				) / (1024 * 1024)
+				if compressedSizeMB >= lastReportedMB+progressReportIntervalMB {
+					copySpec.ProgressListener(compressedSizeMB)
+					lastReportedMB = compressedSizeMB
 				}
 			}
 		}
 
 		if readErr != nil {
 			if readErr != io.EOF {
-				return totalBytesWritten, readErr
+				return readErr
 			}
 			break
 		}
 	}
 
-	return totalBytesWritten, nil
+	return nil
 }
 
 func (uc *CreateMariadbBackupUsecase) createBackupContext(
 	parentCtx context.Context,
-) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(parentCtx, backupTimeout)
+) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(parentCtx)
+
+	timeout := time.AfterFunc(backupTimeout, func() { cancel(errBackupTimeout) })
 
 	go func() {
+		defer timeout.Stop()
+
 		ticker := time.NewTicker(shutdownCheckInterval)
 		defer ticker.Stop()
 
@@ -432,11 +456,11 @@ func (uc *CreateMariadbBackupUsecase) createBackupContext(
 			case <-ctx.Done():
 				return
 			case <-parentCtx.Done():
-				cancel()
+				cancel(context.Cause(parentCtx))
 				return
 			case <-ticker.C:
 				if config.IsShouldShutdown() {
-					cancel()
+					cancel(errBackupShutdown)
 					return
 				}
 			}
@@ -549,11 +573,19 @@ func (uc *CreateMariadbBackupUsecase) closeWriters(
 	return nil
 }
 
-func (uc *CreateMariadbBackupUsecase) checkCancellationReason() error {
-	if config.IsShouldShutdown() {
-		return fmt.Errorf("backup cancelled due to shutdown")
+func (uc *CreateMariadbBackupUsecase) classifyCancellation(ctx context.Context) error {
+	cause := context.Cause(ctx)
+
+	switch {
+	case errors.Is(cause, errBackupShutdown):
+		return errors.New("backup cancelled due to shutdown")
+	case errors.Is(cause, errBackupTimeout):
+		return errors.New("backup cancelled due to timeout")
+	case cause == nil, errors.Is(cause, context.Canceled), errors.Is(cause, context.DeadlineExceeded):
+		return errors.New("backup cancelled")
+	default:
+		return fmt.Errorf("save to storage: %w", cause)
 	}
-	return fmt.Errorf("backup cancelled")
 }
 
 func (uc *CreateMariadbBackupUsecase) buildMariadbDumpErrorMessage(
@@ -595,6 +627,15 @@ func (uc *CreateMariadbBackupUsecase) handleConnectionErrors(stderrStr string) e
 		containsIgnoreCase(stderrStr, "connection refused") {
 		return fmt.Errorf(
 			"MariaDB connection refused. Check if the server is running and accessible. stderr: %s",
+			stderrStr,
+		)
+	}
+
+	if isCompressionRejection(stderrStr) {
+		return fmt.Errorf(
+			"MariaDB rejected the network compression algorithm that had just passed the "+
+				"pre-flight handshake probe. Compression is re-probed on every run, so retry "+
+				"the backup. stderr: %s",
 			stderrStr,
 		)
 	}
