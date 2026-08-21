@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
@@ -27,16 +29,19 @@ type MysqlDatabase struct {
 
 	Version tools.MysqlVersion `json:"version" gorm:"type:text;not null"`
 
-	Host                string   `json:"host"                gorm:"type:text;not null"`
-	Port                int      `json:"port"                gorm:"type:int;not null"`
-	Username            string   `json:"username"            gorm:"type:text;not null"`
-	Password            string   `json:"password"            gorm:"type:text;not null"`
-	Database            *string  `json:"database"            gorm:"type:text"`
-	IsHttps             bool     `json:"isHttps"             gorm:"type:boolean;default:false"`
-	ExcludeTables       []string `json:"excludeTables"       gorm:"-"`
-	ExcludeTablesString string   `json:"-"                   gorm:"column:exclude_tables;type:text;not null;default:''"`
-	Privileges          string   `json:"privileges"          gorm:"column:privileges;type:text;not null;default:''"`
-	IsUseExtendedInsert bool     `json:"isUseExtendedInsert" gorm:"column:is_use_extended_insert;type:boolean;not null;default:false"`
+	Host     string  `json:"host"     gorm:"type:text;not null"`
+	Port     int     `json:"port"     gorm:"type:int;not null"`
+	Username string  `json:"username" gorm:"type:text;not null"`
+	Password string  `json:"password" gorm:"type:text;not null"`
+	Database *string `json:"database" gorm:"type:text"`
+	IsHttps  bool    `json:"isHttps"  gorm:"type:boolean;default:false"`
+
+	// When the tunnel is enabled, Host and Port above address the database as the bastion sees it.
+	SshTunnel sshtunnel.Config `json:"sshTunnel" gorm:"embedded;embeddedPrefix:ssh_"`
+
+	ExcludeTables       []string `json:"excludeTables" gorm:"-"`
+	ExcludeTablesString string   `json:"-"             gorm:"column:exclude_tables;type:text;not null;default:''"`
+	Privileges          string   `json:"privileges"    gorm:"column:privileges;type:text;not null;default:''"`
 }
 
 func (m *MysqlDatabase) TableName() string {
@@ -68,7 +73,8 @@ func (m *MysqlDatabase) Validate() error {
 	if m.Password == "" {
 		return errors.New("password is required")
 	}
-	return nil
+
+	return m.SshTunnel.Validate()
 }
 
 func (m *MysqlDatabase) TestConnection(
@@ -91,11 +97,14 @@ func (m *MysqlDatabase) TestConnection(
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
+		// The DSN carries the password, so only the database name goes into the log.
+		logger.ErrorContext(ctx, "failed to open the mysql connection", "database_name", *m.Database, "error", err)
+
 		return fmt.Errorf("failed to connect to MySQL database '%s': %w", *m.Database, err)
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close MySQL connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close the mysql connection", "error", closeErr)
 		}
 	}()
 
@@ -104,6 +113,8 @@ func (m *MysqlDatabase) TestConnection(
 	db.SetMaxIdleConns(1)
 
 	if err := db.PingContext(ctx); err != nil {
+		logger.ErrorContext(ctx, "failed to ping the mysql database", "database_name", *m.Database, "error", err)
+
 		return fmt.Errorf("failed to ping MySQL database '%s': %w", *m.Database, err)
 	}
 
@@ -148,7 +159,7 @@ func (m *MysqlDatabase) GetRawDbSizeMb(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close MySQL connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close MySQL connection", "error", closeErr)
 		}
 	}()
 
@@ -175,6 +186,7 @@ func (m *MysqlDatabase) HideSensitiveData() {
 		return
 	}
 	m.Password = ""
+	m.SshTunnel.HideSensitiveData()
 }
 
 func (m *MysqlDatabase) Update(incoming *MysqlDatabase) {
@@ -186,11 +198,28 @@ func (m *MysqlDatabase) Update(incoming *MysqlDatabase) {
 	m.IsHttps = incoming.IsHttps
 	m.ExcludeTables = incoming.ExcludeTables
 	m.Privileges = incoming.Privileges
-	m.IsUseExtendedInsert = incoming.IsUseExtendedInsert
+	m.SshTunnel.Update(&incoming.SshTunnel)
 
 	if incoming.Password != "" {
 		m.Password = incoming.Password
 	}
+}
+
+func (m *MysqlDatabase) CopyForNewDatabase() *MysqlDatabase {
+	if m == nil {
+		return nil
+	}
+
+	copiedDatabase := *m
+	copiedDatabase.ID = uuid.Nil
+	copiedDatabase.DatabaseID = nil
+	copiedDatabase.ExcludeTables = slices.Clone(m.ExcludeTables)
+
+	if m.Database != nil {
+		copiedDatabase.Database = new(*m.Database)
+	}
+
+	return &copiedDatabase
 }
 
 func (m *MysqlDatabase) EncryptSensitiveFields(
@@ -203,7 +232,8 @@ func (m *MysqlDatabase) EncryptSensitiveFields(
 		}
 		m.Password = encrypted
 	}
-	return nil
+
+	return m.SshTunnel.EncryptSensitiveFields(encryptor)
 }
 
 func (m *MysqlDatabase) PopulateDbData(
@@ -230,7 +260,7 @@ func (m *MysqlDatabase) PopulateDbData(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close the connection", "error", closeErr)
 		}
 	}()
 
@@ -273,7 +303,7 @@ func (m *MysqlDatabase) PopulateVersion(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close the connection", "error", closeErr)
 		}
 	}()
 
@@ -304,7 +334,7 @@ func (m *MysqlDatabase) IsUserReadOnly(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -383,7 +413,7 @@ func (m *MysqlDatabase) CreateReadOnlyUser(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -401,7 +431,7 @@ func (m *MysqlDatabase) CreateReadOnlyUser(
 		defer func() {
 			if !success {
 				if rollbackErr := tx.Rollback(); rollbackErr != nil {
-					logger.Error("Failed to rollback transaction", "error", rollbackErr)
+					logger.ErrorContext(ctx, "failed to rollback transaction", "error", rollbackErr)
 				}
 			}
 		}()
@@ -445,8 +475,9 @@ func (m *MysqlDatabase) CreateReadOnlyUser(
 		}
 
 		success = true
-		logger.Info(
-			"Read-only MySQL user created successfully",
+		logger.InfoContext(
+			ctx,
+			"read-only MySQL user created successfully",
 			"username",
 			newUsername,
 		)

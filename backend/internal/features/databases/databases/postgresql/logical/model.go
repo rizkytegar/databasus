@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"gorm.io/gorm"
 
 	postgresql_shared "databasus-backend/internal/features/databases/databases/postgresql/shared"
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
@@ -38,6 +40,13 @@ type PostgresqlLogicalDatabase struct {
 	SslClientCert string                            `json:"sslClientCert" gorm:"column:ssl_client_cert;type:text;not null;default:''"`
 	SslClientKey  string                            `json:"sslClientKey"  gorm:"column:ssl_client_key;type:text;not null;default:''"`
 	SslRootCert   string                            `json:"sslRootCert"   gorm:"column:ssl_root_cert;type:text;not null;default:''"`
+
+	// When the tunnel is enabled, Host and Port above address the database as the bastion sees it.
+	SshTunnel sshtunnel.Config `json:"sshTunnel" gorm:"embedded;embeddedPrefix:ssh_"`
+
+	// Set only on the copy handed out by OpenTunnel, so CredentialSpec can point libpq at the
+	// forwarded port while Host keeps the name that TLS and .pgpass are matched against.
+	LocalTunnelEndpoint *sshtunnel.Endpoint `json:"-" gorm:"-"`
 
 	// backup settings
 	IncludeSchemas       []string `json:"includeSchemas"     gorm:"-"`
@@ -100,40 +109,23 @@ func (p *PostgresqlLogicalDatabase) Validate() error {
 		return err
 	}
 
+	if err := p.SshTunnel.Validate(); err != nil {
+		return err
+	}
+
 	// Prevent Databasus from backing up itself
 	// Databasus runs an internal PostgreSQL instance that should not be backed up through the UI
 	// because it would expose internal metadata to non-system administrators.
 	// To properly backup Databasus, see: https://databasus.com/faq#backup-databasus
-	if p.Database != nil && *p.Database != "" {
-		localhostHosts := []string{
-			"localhost",
-			"127.0.0.1",
-			"172.17.0.1",
-			"host.docker.internal",
-			"::1",     // IPv6 loopback (equivalent to 127.0.0.1)
-			"::",      // IPv6 all interfaces (equivalent to 0.0.0.0)
-			"0.0.0.0", // IPv4 all interfaces
-		}
-
-		isLocalhost := false
-
-		for _, host := range localhostHosts {
-			if strings.EqualFold(p.Host, host) {
-				isLocalhost = true
-				break
-			}
-		}
-
-		// Also check if the host is in the entire 127.0.0.0/8 loopback range
-		if strings.HasPrefix(p.Host, "127.") {
-			isLocalhost = true
-		}
-
-		if isLocalhost && strings.EqualFold(*p.Database, "databasus") {
-			return errors.New(
-				"backing up Databasus internal database is not allowed. To backup Databasus itself, see https://databasus.com/faq#backup-databasus",
-			)
-		}
+	// Only a remote bastion relaxes it: there a loopback address names a database on the bastion,
+	// whereas a bastion on this machine would forward straight back to the instance being guarded.
+	if !p.isReachedThroughARemoteBastion() &&
+		p.Database != nil &&
+		isLocalhostAddress(p.Host) &&
+		strings.EqualFold(*p.Database, "databasus") {
+		return errors.New(
+			"backing up Databasus internal database is not allowed. To backup Databasus itself, see https://databasus.com/faq#backup-databasus",
+		)
 	}
 
 	return nil
@@ -166,7 +158,7 @@ func (p *PostgresqlLogicalDatabase) GetRawDbSizeMb(
 	}
 	defer func() {
 		if closeErr := conn.Close(ctx); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -188,6 +180,7 @@ func (p *PostgresqlLogicalDatabase) HideSensitiveData() {
 
 	p.Password = ""
 	p.SslClientKey = ""
+	p.SshTunnel.HideSensitiveData()
 }
 
 func (p *PostgresqlLogicalDatabase) ValidateUpdate(_ *PostgresqlLogicalDatabase) error {
@@ -207,6 +200,7 @@ func (p *PostgresqlLogicalDatabase) Update(incoming *PostgresqlLogicalDatabase) 
 	p.ExcludeTables = incoming.ExcludeTables
 	p.CpuCount = incoming.CpuCount
 	p.IsSkipUserMappings = incoming.IsSkipUserMappings
+	p.SshTunnel.Update(&incoming.SshTunnel)
 
 	if incoming.Password != "" {
 		p.Password = incoming.Password
@@ -215,6 +209,26 @@ func (p *PostgresqlLogicalDatabase) Update(incoming *PostgresqlLogicalDatabase) 
 	if incoming.SslClientKey != "" {
 		p.SslClientKey = incoming.SslClientKey
 	}
+}
+
+// LocalTunnelEndpoint belongs to the operation that opened the tunnel, not to the configuration.
+func (p *PostgresqlLogicalDatabase) CopyForNewDatabase() *PostgresqlLogicalDatabase {
+	if p == nil {
+		return nil
+	}
+
+	copiedDatabase := *p
+	copiedDatabase.ID = uuid.Nil
+	copiedDatabase.DatabaseID = nil
+	copiedDatabase.IncludeSchemas = slices.Clone(p.IncludeSchemas)
+	copiedDatabase.ExcludeTables = slices.Clone(p.ExcludeTables)
+	copiedDatabase.LocalTunnelEndpoint = nil
+
+	if p.Database != nil {
+		copiedDatabase.Database = new(*p.Database)
+	}
+
+	return &copiedDatabase
 }
 
 func (p *PostgresqlLogicalDatabase) EncryptSensitiveFields(
@@ -238,7 +252,7 @@ func (p *PostgresqlLogicalDatabase) EncryptSensitiveFields(
 		*field = encrypted
 	}
 
-	return nil
+	return p.SshTunnel.EncryptSensitiveFields(encryptor)
 }
 
 // PopulateDbData detects and sets the PostgreSQL version.
@@ -268,7 +282,7 @@ func (p *PostgresqlLogicalDatabase) PopulateVersion(
 	}
 	defer func() {
 		if closeErr := conn.Close(ctx); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.Error("failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -306,7 +320,7 @@ func (p *PostgresqlLogicalDatabase) IsUserReadOnly(
 	}
 	defer func() {
 		if closeErr := conn.Close(ctx); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -470,7 +484,7 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 	}
 	defer func() {
 		if closeErr := conn.Close(ctx); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -515,7 +529,7 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 		defer func() {
 			if !success {
 				if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-					logger.Error("Failed to rollback transaction", "error", rollbackErr)
+					logger.ErrorContext(ctx, "failed to rollback transaction", "error", rollbackErr)
 				}
 			}
 		}()
@@ -554,8 +568,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 			_, err = tx.Exec(ctx, `REVOKE CREATE ON SCHEMA public FROM PUBLIC`)
 			if err != nil {
 				if strings.Contains(err.Error(), "permission denied") {
-					logger.Warn(
-						"Failed to revoke CREATE on public from PUBLIC (permission denied)",
+					logger.WarnContext(
+						ctx,
+						"failed to revoke CREATE on public from PUBLIC (permission denied)",
 						"error",
 						err,
 					)
@@ -570,8 +585,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 				fmt.Sprintf(`REVOKE CREATE ON SCHEMA public FROM "%s"`, baseUsername),
 			)
 			if err != nil {
-				logger.Warn(
-					"Failed to revoke CREATE on public schema from user",
+				logger.WarnContext(
+					ctx,
+					"failed to revoke CREATE on public schema from user",
 					"error",
 					err,
 					"username",
@@ -579,7 +595,7 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 				)
 			}
 		} else {
-			logger.Info("Public schema does not exist, skipping CREATE privilege revocation")
+			logger.InfoContext(ctx, "public schema does not exist, skipping CREATE privilege revocation")
 		}
 
 		// Step 3: Grant database connection privilege and revoke TEMP
@@ -594,7 +610,7 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 		// Revoke TEMP privilege from PUBLIC role (like CREATE on public schema, TEMP is granted to PUBLIC by default)
 		_, err = tx.Exec(ctx, fmt.Sprintf(`REVOKE TEMP ON DATABASE "%s" FROM PUBLIC`, *p.Database))
 		if err != nil {
-			logger.Warn("Failed to revoke TEMP from PUBLIC", "error", err)
+			logger.WarnContext(ctx, "failed to revoke TEMP from PUBLIC", "error", err)
 		}
 
 		// Also revoke from the specific user (belt and suspenders)
@@ -603,7 +619,7 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 			fmt.Sprintf(`REVOKE TEMP ON DATABASE "%s" FROM "%s"`, *p.Database, baseUsername),
 		)
 		if err != nil {
-			logger.Warn("Failed to revoke TEMP privilege", "error", err, "username", baseUsername)
+			logger.WarnContext(ctx, "failed to revoke TEMP privilege", "error", err, "username", baseUsername)
 		}
 
 		// Step 4: Discover schemas to grant privileges on
@@ -650,8 +666,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 				fmt.Sprintf(`REVOKE CREATE ON SCHEMA "%s" FROM "%s"`, schema, baseUsername),
 			)
 			if err != nil {
-				logger.Warn(
-					"Failed to revoke CREATE on schema",
+				logger.WarnContext(
+					ctx,
+					"failed to revoke CREATE on schema",
 					"error",
 					err,
 					"schema",
@@ -780,14 +797,14 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 
 		if err != nil {
 			// Log warning but continue - this is a best-effort enhancement
-			logger.Warn("Failed to query object owners for default privileges", "error", err)
+			logger.WarnContext(ctx, "failed to query object owners for default privileges", "error", err)
 		} else {
 			var schemaOwners []SchemaOwner
 			for ownerRows.Next() {
 				var so SchemaOwner
 				if err := ownerRows.Scan(&so.SchemaName, &so.RoleName); err != nil {
 					ownerRows.Close()
-					logger.Warn("Failed to scan schema owner", "error", err)
+					logger.WarnContext(ctx, "failed to scan schema owner", "error", err)
 					break
 				}
 				schemaOwners = append(schemaOwners, so)
@@ -795,7 +812,7 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 			ownerRows.Close()
 
 			if err := ownerRows.Err(); err != nil {
-				logger.Warn("Error iterating schema owners", "error", err)
+				logger.WarnContext(ctx, "error iterating schema owners", "error", err)
 			}
 
 			// Step 9: Set default privileges FOR ROLE for each object owner
@@ -813,8 +830,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 					),
 				)
 				if err != nil {
-					logger.Warn(
-						"Failed to set default privileges for role (tables)",
+					logger.WarnContext(
+						ctx,
+						"failed to set default privileges for role (tables)",
 						"error",
 						err,
 						"role",
@@ -837,8 +855,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 					),
 				)
 				if err != nil {
-					logger.Warn(
-						"Failed to set default privileges for role (sequences)",
+					logger.WarnContext(
+						ctx,
+						"failed to set default privileges for role (sequences)",
 						"error",
 						err,
 						"role",
@@ -852,8 +871,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 			}
 
 			if len(schemaOwners) > 0 {
-				logger.Info(
-					"Set default privileges for existing object owners",
+				logger.InfoContext(
+					ctx,
+					"set default privileges for existing object owners",
 					"readonly_user",
 					baseUsername,
 					"owner_count",
@@ -876,8 +896,9 @@ func (p *PostgresqlLogicalDatabase) CreateReadOnlyUser(
 
 		success = true
 		// Return connectionUsername (with project ID suffix for Supabase) for the caller to use when connecting
-		logger.Info(
-			"Read-only user created successfully",
+		logger.InfoContext(
+			ctx,
+			"read-only user created successfully",
 			"username",
 			baseUsername,
 			"connectionUsername",
@@ -921,7 +942,7 @@ func testSingleDatabaseConnection(
 	}
 	defer func() {
 		if closeErr := conn.Close(ctx); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -1142,4 +1163,29 @@ func extractSupabaseProjectID(username string) string {
 		return after
 	}
 	return ""
+}
+
+func (p *PostgresqlLogicalDatabase) isReachedThroughARemoteBastion() bool {
+	return p.SshTunnel.IsEnabled && !isLocalhostAddress(p.SshTunnel.Host)
+}
+
+func isLocalhostAddress(host string) bool {
+	localhostHosts := []string{
+		"localhost",
+		"127.0.0.1",
+		"172.17.0.1",
+		"host.docker.internal",
+		"::1",     // IPv6 loopback (equivalent to 127.0.0.1)
+		"::",      // IPv6 all interfaces (equivalent to 0.0.0.0)
+		"0.0.0.0", // IPv4 all interfaces
+	}
+
+	for _, localhostHost := range localhostHosts {
+		if strings.EqualFold(host, localhostHost) {
+			return true
+		}
+	}
+
+	// The entire 127.0.0.0/8 loopback range, not just 127.0.0.1
+	return strings.HasPrefix(host, "127.")
 }

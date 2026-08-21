@@ -425,7 +425,13 @@ func Test_SendFullBackupNotification_WhenTypeNotInSendOn_DoesNotSend(t *testing.
 		Status: physical_enums.PhysicalBackupStatusCompleted,
 	}
 
-	backuper.sendFullBackupNotification(cfg, database, fullBackup, postgresql_executor.PhysicalBackupResult{})
+	backuper.sendFullBackupNotification(
+		t.Context(),
+		cfg,
+		database,
+		fullBackup,
+		postgresql_executor.PhysicalBackupResult{},
+	)
 
 	assert.Empty(t, sender.sentNotifications)
 }
@@ -452,7 +458,13 @@ func Test_SendFullBackupNotification_WhenEnabled_FansOutToAllNotifiers(t *testin
 		Status: physical_enums.PhysicalBackupStatusCompleted,
 	}
 
-	backuper.sendFullBackupNotification(cfg, database, fullBackup, postgresql_executor.PhysicalBackupResult{})
+	backuper.sendFullBackupNotification(
+		t.Context(),
+		cfg,
+		database,
+		fullBackup,
+		postgresql_executor.PhysicalBackupResult{},
+	)
 
 	require.Len(t, sender.sentNotifications, 2)
 	notifiedIDs := []uuid.UUID{
@@ -465,13 +477,15 @@ func Test_SendFullBackupNotification_WhenEnabled_FansOutToAllNotifiers(t *testin
 	assert.Equal(t, notifier_models.NotificationTypeBackupSuccess, sender.sentNotifications[0].Notification.Type)
 }
 
-func Test_LoadBackupContext_WhenNotEncrypted_LeavesMasterKeyEmpty(t *testing.T) {
+func Test_OpenBackupContext_WhenNotEncrypted_LeavesMasterKeyEmpty(t *testing.T) {
 	prereqs := seedBackupPrereqs(t)
 	backuper := CreateTestPhysicalBackuper(nil)
 
-	backupCtx, ok := backuper.loadBackupContext(logger.GetLogger(), prereqs.DB.ID)
+	backupCtx, ok := backuper.openBackupContext(t.Context(), logger.GetLogger(), prereqs.DB.ID)
 	require.True(t, ok)
 	require.NotNil(t, backupCtx)
+
+	defer backupCtx.Close()
 
 	assert.Empty(t, backupCtx.MasterKey)
 	assert.NotNil(t, backupCtx.Config)
@@ -479,32 +493,34 @@ func Test_LoadBackupContext_WhenNotEncrypted_LeavesMasterKeyEmpty(t *testing.T) 
 	assert.NotNil(t, backupCtx.Storage)
 }
 
-func Test_LoadBackupContext_WhenEncrypted_PopulatesMasterKey(t *testing.T) {
+func Test_OpenBackupContext_WhenEncrypted_PopulatesMasterKey(t *testing.T) {
 	prereqs := seedBackupPrereqs(t)
 	backuper := CreateTestPhysicalBackuper(nil)
 
 	prereqs.Config.Encryption = backups_core_enums.BackupEncryptionEncrypted
-	_, err := backups_config_physical.GetBackupConfigService().SaveBackupConfig(prereqs.Config)
+	_, err := backups_config_physical.GetBackupConfigService().SaveBackupConfig(t.Context(), prereqs.Config)
 	require.NoError(t, err)
 
-	backupCtx, ok := backuper.loadBackupContext(logger.GetLogger(), prereqs.DB.ID)
+	backupCtx, ok := backuper.openBackupContext(t.Context(), logger.GetLogger(), prereqs.DB.ID)
 	require.True(t, ok)
 	require.NotNil(t, backupCtx)
+
+	defer backupCtx.Close()
 
 	assert.NotEmpty(t, backupCtx.MasterKey)
 }
 
-func Test_LoadBackupContext_WhenConfigHasNoStorageID_ReturnsNotOk(t *testing.T) {
+func Test_OpenBackupContext_WhenConfigHasNoStorageID_ReturnsNotOk(t *testing.T) {
 	prereqs := seedBackupPrereqs(t)
 	backuper := CreateTestPhysicalBackuper(nil)
 
 	prereqs.Config.IsBackupsEnabled = false
 	prereqs.Config.StorageID = nil
 	prereqs.Config.Storage = nil
-	_, err := backups_config_physical.GetBackupConfigService().SaveBackupConfig(prereqs.Config)
+	_, err := backups_config_physical.GetBackupConfigService().SaveBackupConfig(t.Context(), prereqs.Config)
 	require.NoError(t, err)
 
-	_, ok := backuper.loadBackupContext(logger.GetLogger(), prereqs.DB.ID)
+	_, ok := backuper.openBackupContext(t.Context(), logger.GetLogger(), prereqs.DB.ID)
 	assert.False(t, ok)
 }
 
@@ -513,7 +529,7 @@ func Test_MakeBackup_WhenRowAbsentInBothTables_InvokesNoExecutor(t *testing.T) {
 	backuper := CreateTestPhysicalBackuper(sender)
 	fullExecutor, incrExecutor := installFakeExecutors(backuper)
 
-	backuper.MakeBackup(uuid.New(), false)
+	backuper.MakeBackup(t.Context(), uuid.New(), false)
 
 	assert.Equal(t, 0, fullExecutor.callCount)
 	assert.Equal(t, 0, incrExecutor.callCount)
@@ -528,7 +544,7 @@ func Test_MakeBackup_WhenFullRowExists_InvokesFullExecutorOnly(t *testing.T) {
 
 	fullBackup := seedInProgressFull(t, prereqs)
 
-	backuper.MakeBackup(fullBackup.ID, false)
+	backuper.MakeBackup(t.Context(), fullBackup.ID, false)
 
 	assert.Equal(t, 1, fullExecutor.callCount)
 	assert.Equal(t, 0, incrExecutor.callCount)
@@ -548,7 +564,7 @@ func Test_MakeBackup_WhenIncrementalRowExists_InvokesIncrementalExecutorOnly(t *
 	rootFull := seedCompletedRootFull(t, prereqs)
 	incrBackup := seedInProgressIncr(t, prereqs, rootFull.ID)
 
-	backuper.MakeBackup(incrBackup.ID, false)
+	backuper.MakeBackup(t.Context(), incrBackup.ID, false)
 
 	assert.Equal(t, 0, fullExecutor.callCount)
 	assert.Equal(t, 1, incrExecutor.callCount)
@@ -567,7 +583,7 @@ func Test_RunFullBackup_WhenExecutorReturnsGoError_FlipsToErrorAndSkipsNotificat
 
 	fullBackup := seedInProgressFull(t, prereqs)
 
-	backuper.MakeBackup(fullBackup.ID, true)
+	backuper.MakeBackup(t.Context(), fullBackup.ID, true)
 
 	assert.Equal(t, 1, fullExecutor.callCount)
 
@@ -593,7 +609,7 @@ func Test_RunFullBackup_WhenExecutorResultErrorStatus_PersistsErrorAndSendsFaile
 
 	fullBackup := seedInProgressFull(t, prereqs)
 
-	backuper.MakeBackup(fullBackup.ID, true)
+	backuper.MakeBackup(t.Context(), fullBackup.ID, true)
 
 	persisted, err := physical_repositories.GetFullBackupRepository().FindByID(fullBackup.ID)
 	require.NoError(t, err)
@@ -616,7 +632,7 @@ func Test_RunFullBackup_WhenExecutorResultChainBroken_PersistsChainBrokenAndSend
 
 	fullBackup := seedInProgressFull(t, prereqs)
 
-	backuper.MakeBackup(fullBackup.ID, true)
+	backuper.MakeBackup(t.Context(), fullBackup.ID, true)
 
 	persisted, err := physical_repositories.GetFullBackupRepository().FindByID(fullBackup.ID)
 	require.NoError(t, err)
@@ -639,7 +655,7 @@ func Test_RunIncrementalBackup_WhenParentManifestMissing_FlipsToChainBrokenBefor
 	physical_testing.CreateTestFullBackup(t, rootFull)
 	incrBackup := seedInProgressIncr(t, prereqs, rootFull.ID)
 
-	backuper.MakeBackup(incrBackup.ID, true)
+	backuper.MakeBackup(t.Context(), incrBackup.ID, true)
 
 	assert.Equal(t, 0, incrExecutor.callCount, "executor must not run when the parent manifest is unresolved")
 
@@ -664,7 +680,7 @@ func Test_RunIncrementalBackup_WhenExecutorResultErrorStatus_PersistsErrorAndSen
 	rootFull := seedCompletedRootFull(t, prereqs)
 	incrBackup := seedInProgressIncr(t, prereqs, rootFull.ID)
 
-	backuper.MakeBackup(incrBackup.ID, true)
+	backuper.MakeBackup(t.Context(), incrBackup.ID, true)
 
 	assert.Equal(t, 1, incrExecutor.callCount)
 

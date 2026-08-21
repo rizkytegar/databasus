@@ -72,47 +72,54 @@ func (uc *CreateMysqlBackupUsecase) Execute(
 	storage *storages.Storage,
 	backupProgressListener func(completedMBs float64),
 ) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info(
-		"Creating MySQL backup via mysqldump",
-		"databaseId", db.ID,
-		"storageId", storage.ID,
-	)
+	logger := uc.logger.With("database_id", db.ID, "storage_id", storage.ID)
 
-	my := db.Mysql
-	if my == nil {
+	logger.InfoContext(ctx, "creating mysql backup via mysqldump")
+
+	tunneledDatabase, err := databases.OpenTunnel(ctx, databases.OpenTunnelSpec{
+		Database:  db,
+		Logger:    logger,
+		Encryptor: uc.fieldEncryptor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	mysqlDatabase := tunneledDatabase.GetDatabaseThroughTunnel().Mysql
+	if mysqlDatabase == nil {
 		return nil, fmt.Errorf("mysql database configuration is required")
 	}
 
-	if my.Database == nil || *my.Database == "" {
+	if mysqlDatabase.Database == nil || *mysqlDatabase.Database == "" {
 		return nil, fmt.Errorf("database name is required for mysqldump backups")
 	}
 
-	decryptedPassword, err := uc.fieldEncryptor.Decrypt(my.Password)
+	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mysqlDatabase.Password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt database password: %w", err)
 	}
 
-	rawSizeMB, err := my.GetRawDbSizeMb(ctx, uc.logger, uc.fieldEncryptor)
+	rawSizeMB, err := mysqlDatabase.GetRawDbSizeMb(ctx, logger, uc.fieldEncryptor)
 	if err != nil {
-		uc.logger.Warn("failed to fetch raw db size before backup",
-			"database_id", db.ID,
-			"error", err)
+		logger.WarnContext(ctx, "failed to fetch raw db size before backup", "error", err)
 	} else {
 		backup.BackupRawDbSizeMb = rawSizeMB
 	}
 
-	args := uc.buildMysqldumpArgs(my)
+	args := uc.buildMysqldumpArgs(mysqlDatabase)
 
 	return uc.streamToStorage(
 		ctx,
 		backup,
 		backupConfig,
-		tools.GetMysqlExecutable(my.Version, tools.MysqlExecutableMysqldump),
+		tools.GetMysqlExecutable(mysqlDatabase.Version, tools.MysqlExecutableMysqldump),
 		args,
 		decryptedPassword,
 		storage,
 		backupProgressListener,
-		my,
+		mysqlDatabase,
 	)
 }
 
@@ -127,13 +134,6 @@ func (uc *CreateMysqlBackupUsecase) buildMysqldumpArgs(my *mysqltypes.MysqlDatab
 		"--quick",
 		"--skip-add-locks",
 		"--verbose",
-	}
-
-	// One INSERT per row caps mysqldump memory on huge tables, but bloats the
-	// dump and makes restores far slower. Opting into extended inserts batches
-	// rows (mysqldump's default) for fast restores at higher backup memory.
-	if !my.IsUseExtendedInsert {
-		args = append(args, "--skip-extended-insert")
 	}
 
 	if my.HasPrivilege("TRIGGER") {
@@ -175,7 +175,7 @@ func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	backupProgressListener func(completedMBs float64),
 	myConfig *mysqltypes.MysqlDatabase,
 ) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info("Streaming MySQL backup to storage", "mysqlBin", mysqlBin)
+	uc.logger.InfoContext(parentCtx, "streaming MySQL backup to storage", "mysql_bin", mysqlBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
 	defer cancel(nil)
@@ -197,7 +197,7 @@ func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	fullArgs = append(fullArgs, args...)
 
 	cmd := exec.CommandContext(ctx, mysqlBin, fullArgs...)
-	uc.logger.Info("Executing MySQL backup command", "command", cmd.String())
+	uc.logger.InfoContext(parentCtx, "executing MySQL backup command", "command", cmd.String())
 
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
@@ -293,7 +293,7 @@ func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	}
 
 	if err := zstdWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close zstd writer", "error", err)
+		uc.logger.ErrorContext(parentCtx, "failed to close zstd writer", "error", err)
 	}
 	if err := uc.closeWriters(encryptionWriter, storageWriter); err != nil {
 		<-saveErrCh
@@ -477,7 +477,7 @@ func (uc *CreateMysqlBackupUsecase) setupBackupEncryption(
 
 	if backupConfig.Encryption != backups_core_enums.BackupEncryptionEncrypted {
 		metadata.Encryption = backups_core_enums.BackupEncryptionNone
-		uc.logger.Info("Encryption disabled for backup", "backupId", backupID)
+		uc.logger.Info("encryption disabled for backup", "backup_id", backupID)
 		return storageWriter, nil, metadata, nil
 	}
 
@@ -495,7 +495,7 @@ func (uc *CreateMysqlBackupUsecase) setupBackupEncryption(
 	metadata.EncryptionIV = &encSetup.NonceBase64
 	metadata.Encryption = backups_core_enums.BackupEncryptionEncrypted
 
-	uc.logger.Info("Encryption enabled for backup", "backupId", backupID)
+	uc.logger.Info("encryption enabled for backup", "backup_id", backupID)
 	return encSetup.Writer, encSetup.Writer, metadata, nil
 }
 
@@ -530,7 +530,7 @@ func (uc *CreateMysqlBackupUsecase) cleanupOnCancellation(
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer during cancellation", "error", err)
+		uc.logger.Error("failed to close pipe writer during cancellation", "error", err)
 	}
 
 	<-saveErrCh
@@ -545,7 +545,7 @@ func (uc *CreateMysqlBackupUsecase) closeWriters(
 		go func() {
 			closeErr := encryptionWriter.Close()
 			if closeErr != nil {
-				uc.logger.Error("Failed to close encrypting writer", "error", closeErr)
+				uc.logger.Error("failed to close encrypting writer", "error", closeErr)
 			}
 			encryptionCloseErrCh <- closeErr
 		}()
@@ -556,13 +556,13 @@ func (uc *CreateMysqlBackupUsecase) closeWriters(
 	encryptionCloseErr := <-encryptionCloseErrCh
 	if encryptionCloseErr != nil {
 		if err := storageWriter.Close(); err != nil {
-			uc.logger.Error("Failed to close pipe writer after encryption error", "error", err)
+			uc.logger.Error("failed to close pipe writer after encryption error", "error", err)
 		}
 		return fmt.Errorf("failed to close encryption writer: %w", encryptionCloseErr)
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer", "error", err)
+		uc.logger.Error("failed to close pipe writer", "error", err)
 		return err
 	}
 

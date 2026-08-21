@@ -41,17 +41,17 @@ func createServiceTestPrereqs(t *testing.T) *serviceTestPrereqs {
 		workspaces_controllers.GetMembershipController(),
 		databases.GetDatabaseController(),
 	)
-	user := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Phys Service "+uuid.NewString(), user, router)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Phys Service "+uuid.NewString(), user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestPhysicalPostgresDatabase(workspace.ID, notifier, "17")
 
 	t.Cleanup(func() {
 		physical_testing.DeleteAllPhysicalCatalogForDatabase(t, database.ID)
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 	})
 
 	return &serviceTestPrereqs{storage: storage, database: database}
@@ -73,7 +73,7 @@ func saveObject(t *testing.T, st *storages.Storage, fileName string) {
 func objectExists(t *testing.T, st *storages.Storage, fileName string) bool {
 	t.Helper()
 
-	reader, err := st.GetFile(encryption.GetFieldEncryptor(), fileName)
+	reader, err := st.GetFile(t.Context(), encryption.GetFieldEncryptor(), logger.GetLogger(), fileName)
 	if err != nil {
 		return false
 	}

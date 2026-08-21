@@ -82,7 +82,12 @@ func (m *mockWalStorage) stopFailingSaves() {
 	m.isFailingAllSaves.Store(false)
 }
 
-func (m *mockWalStorage) DeleteFile(_ encryption.FieldEncryptor, fileName string) error {
+func (m *mockWalStorage) DeleteFile(
+	_ context.Context,
+	_ encryption.FieldEncryptor,
+	_ *slog.Logger,
+	fileName string,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -92,7 +97,12 @@ func (m *mockWalStorage) DeleteFile(_ encryption.FieldEncryptor, fileName string
 	return nil
 }
 
-func (m *mockWalStorage) GetFile(_ encryption.FieldEncryptor, _ string) (io.ReadCloser, error) {
+func (m *mockWalStorage) GetFile(
+	_ context.Context,
+	_ encryption.FieldEncryptor,
+	_ *slog.Logger,
+	_ string,
+) (io.ReadCloser, error) {
 	return nil, errors.New("GetFile not implemented in mockWalStorage")
 }
 func (m *mockWalStorage) Validate(_ encryption.FieldEncryptor) error             { return nil }

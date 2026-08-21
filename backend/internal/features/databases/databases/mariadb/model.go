@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
@@ -27,18 +29,21 @@ type MariadbDatabase struct {
 
 	Version tools.MariadbVersion `json:"version" gorm:"type:text;not null"`
 
-	Host                string   `json:"host"                gorm:"type:text;not null"`
-	Port                int      `json:"port"                gorm:"type:int;not null"`
-	Username            string   `json:"username"            gorm:"type:text;not null"`
-	Password            string   `json:"password"            gorm:"type:text;not null"`
-	Database            *string  `json:"database"            gorm:"type:text"`
-	IsHttps             bool     `json:"isHttps"             gorm:"type:boolean;default:false"`
-	IsExcludeEvents     bool     `json:"isExcludeEvents"     gorm:"type:boolean;default:false"`
-	IsUseExtendedInsert bool     `json:"isUseExtendedInsert" gorm:"column:is_use_extended_insert;type:boolean;not null;default:false"`
-	IsSkipGaleraDisable bool     `json:"isSkipGaleraDisable" gorm:"column:is_skip_galera_disable;type:boolean;not null;default:false"`
-	ExcludeTables       []string `json:"excludeTables"       gorm:"-"`
-	ExcludeTablesString string   `json:"-"                   gorm:"column:exclude_tables;type:text;not null;default:''"`
-	Privileges          string   `json:"privileges"          gorm:"column:privileges;type:text;not null;default:''"`
+	Host                string  `json:"host"                gorm:"type:text;not null"`
+	Port                int     `json:"port"                gorm:"type:int;not null"`
+	Username            string  `json:"username"            gorm:"type:text;not null"`
+	Password            string  `json:"password"            gorm:"type:text;not null"`
+	Database            *string `json:"database"            gorm:"type:text"`
+	IsHttps             bool    `json:"isHttps"             gorm:"type:boolean;default:false"`
+	IsExcludeEvents     bool    `json:"isExcludeEvents"     gorm:"type:boolean;default:false"`
+	IsSkipGaleraDisable bool    `json:"isSkipGaleraDisable" gorm:"column:is_skip_galera_disable;type:boolean;not null;default:false"`
+
+	// When the tunnel is enabled, Host and Port above address the database as the bastion sees it.
+	SshTunnel sshtunnel.Config `json:"sshTunnel" gorm:"embedded;embeddedPrefix:ssh_"`
+
+	ExcludeTables       []string `json:"excludeTables" gorm:"-"`
+	ExcludeTablesString string   `json:"-"             gorm:"column:exclude_tables;type:text;not null;default:''"`
+	Privileges          string   `json:"privileges"    gorm:"column:privileges;type:text;not null;default:''"`
 }
 
 func (m *MariadbDatabase) TableName() string {
@@ -70,7 +75,8 @@ func (m *MariadbDatabase) Validate() error {
 	if m.Password == "" {
 		return errors.New("password is required")
 	}
-	return nil
+
+	return m.SshTunnel.Validate()
 }
 
 func (m *MariadbDatabase) TestConnection(
@@ -97,7 +103,7 @@ func (m *MariadbDatabase) TestConnection(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close MariaDB connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close the mariadb connection", "error", closeErr)
 		}
 	}()
 
@@ -106,6 +112,8 @@ func (m *MariadbDatabase) TestConnection(
 	db.SetMaxIdleConns(1)
 
 	if err := db.PingContext(ctx); err != nil {
+		logger.ErrorContext(ctx, "failed to ping the mariadb database", "database_name", *m.Database, "error", err)
+
 		return fmt.Errorf("failed to ping MariaDB database '%s': %w", *m.Database, err)
 	}
 
@@ -150,7 +158,7 @@ func (m *MariadbDatabase) GetRawDbSizeMb(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close MariaDB connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close MariaDB connection", "error", closeErr)
 		}
 	}()
 
@@ -177,6 +185,7 @@ func (m *MariadbDatabase) HideSensitiveData() {
 		return
 	}
 	m.Password = ""
+	m.SshTunnel.HideSensitiveData()
 }
 
 func (m *MariadbDatabase) Update(incoming *MariadbDatabase) {
@@ -187,14 +196,31 @@ func (m *MariadbDatabase) Update(incoming *MariadbDatabase) {
 	m.Database = incoming.Database
 	m.IsHttps = incoming.IsHttps
 	m.IsExcludeEvents = incoming.IsExcludeEvents
-	m.IsUseExtendedInsert = incoming.IsUseExtendedInsert
 	m.IsSkipGaleraDisable = incoming.IsSkipGaleraDisable
 	m.ExcludeTables = incoming.ExcludeTables
 	m.Privileges = incoming.Privileges
+	m.SshTunnel.Update(&incoming.SshTunnel)
 
 	if incoming.Password != "" {
 		m.Password = incoming.Password
 	}
+}
+
+func (m *MariadbDatabase) CopyForNewDatabase() *MariadbDatabase {
+	if m == nil {
+		return nil
+	}
+
+	copiedDatabase := *m
+	copiedDatabase.ID = uuid.Nil
+	copiedDatabase.DatabaseID = nil
+	copiedDatabase.ExcludeTables = slices.Clone(m.ExcludeTables)
+
+	if m.Database != nil {
+		copiedDatabase.Database = new(*m.Database)
+	}
+
+	return &copiedDatabase
 }
 
 func (m *MariadbDatabase) EncryptSensitiveFields(
@@ -207,7 +233,8 @@ func (m *MariadbDatabase) EncryptSensitiveFields(
 		}
 		m.Password = encrypted
 	}
-	return nil
+
+	return m.SshTunnel.EncryptSensitiveFields(encryptor)
 }
 
 func (m *MariadbDatabase) PopulateDbData(
@@ -234,7 +261,7 @@ func (m *MariadbDatabase) PopulateDbData(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close the connection", "error", closeErr)
 		}
 	}()
 
@@ -277,7 +304,7 @@ func (m *MariadbDatabase) PopulateVersion(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close the connection", "error", closeErr)
 		}
 	}()
 
@@ -308,7 +335,7 @@ func (m *MariadbDatabase) IsUserReadOnly(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -387,7 +414,7 @@ func (m *MariadbDatabase) CreateReadOnlyUser(
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			logger.Error("Failed to close connection", "error", closeErr)
+			logger.ErrorContext(ctx, "failed to close connection", "error", closeErr)
 		}
 	}()
 
@@ -406,7 +433,7 @@ func (m *MariadbDatabase) CreateReadOnlyUser(
 		defer func() {
 			if !success {
 				if rollbackErr := tx.Rollback(); rollbackErr != nil {
-					logger.Error("Failed to rollback transaction", "error", rollbackErr)
+					logger.ErrorContext(ctx, "failed to rollback transaction", "error", rollbackErr)
 				}
 			}
 		}()
@@ -450,8 +477,9 @@ func (m *MariadbDatabase) CreateReadOnlyUser(
 		}
 
 		success = true
-		logger.Info(
-			"Read-only MariaDB user created successfully",
+		logger.InfoContext(
+			ctx,
+			"read-only MariaDB user created successfully",
 			"username", newUsername,
 		)
 		return newUsername, newPassword, nil

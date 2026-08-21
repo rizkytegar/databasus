@@ -72,47 +72,54 @@ func (uc *CreateMariadbBackupUsecase) Execute(
 	storage *storages.Storage,
 	backupProgressListener func(completedMBs float64),
 ) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info(
-		"Creating MariaDB backup via mariadb-dump",
-		"databaseId", db.ID,
-		"storageId", storage.ID,
-	)
+	logger := uc.logger.With("database_id", db.ID, "storage_id", storage.ID)
 
-	mdb := db.Mariadb
-	if mdb == nil {
+	logger.InfoContext(ctx, "creating mariadb backup via mariadb-dump")
+
+	tunneledDatabase, err := databases.OpenTunnel(ctx, databases.OpenTunnelSpec{
+		Database:  db,
+		Logger:    logger,
+		Encryptor: uc.fieldEncryptor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	mariadbDatabase := tunneledDatabase.GetDatabaseThroughTunnel().Mariadb
+	if mariadbDatabase == nil {
 		return nil, fmt.Errorf("mariadb database configuration is required")
 	}
 
-	if mdb.Database == nil || *mdb.Database == "" {
+	if mariadbDatabase.Database == nil || *mariadbDatabase.Database == "" {
 		return nil, fmt.Errorf("database name is required for mariadb-dump backups")
 	}
 
-	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mdb.Password)
+	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mariadbDatabase.Password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt database password: %w", err)
 	}
 
-	rawSizeMB, err := mdb.GetRawDbSizeMb(ctx, uc.logger, uc.fieldEncryptor)
+	rawSizeMB, err := mariadbDatabase.GetRawDbSizeMb(ctx, logger, uc.fieldEncryptor)
 	if err != nil {
-		uc.logger.Warn("failed to fetch raw db size before backup",
-			"database_id", db.ID,
-			"error", err)
+		logger.WarnContext(ctx, "failed to fetch raw db size before backup", "error", err)
 	} else {
 		backup.BackupRawDbSizeMb = rawSizeMB
 	}
 
-	args := uc.buildMariadbDumpArgs(mdb)
+	args := uc.buildMariadbDumpArgs(mariadbDatabase)
 
 	return uc.streamToStorage(
 		ctx,
 		backup,
 		backupConfig,
-		tools.GetMariadbExecutable(mdb.Version, tools.MariadbExecutableMariadbDump),
+		tools.GetMariadbExecutable(mariadbDatabase.Version, tools.MariadbExecutableMariadbDump),
 		args,
 		decryptedPassword,
 		storage,
 		backupProgressListener,
-		mdb,
+		mariadbDatabase,
 	)
 }
 
@@ -128,13 +135,6 @@ func (uc *CreateMariadbBackupUsecase) buildMariadbDumpArgs(
 		"--quick",
 		"--skip-add-locks",
 		"--verbose",
-	}
-
-	// One INSERT per row caps mariadb-dump memory on huge tables, but bloats the
-	// dump and makes restores far slower. Opting into extended inserts batches
-	// rows (mariadb-dump's default) for fast restores at higher backup memory.
-	if !mdb.IsUseExtendedInsert {
-		args = append(args, "--skip-extended-insert")
 	}
 
 	if mdb.HasPrivilege("TRIGGER") {
@@ -178,7 +178,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	backupProgressListener func(completedMBs float64),
 	mdbConfig *mariadbtypes.MariadbDatabase,
 ) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info("Streaming MariaDB backup to storage", "mariadbBin", mariadbBin)
+	uc.logger.InfoContext(parentCtx, "streaming MariaDB backup to storage", "mariadb_bin", mariadbBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
 	defer cancel(nil)
@@ -201,7 +201,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	fullArgs = append(fullArgs, args...)
 
 	cmd := exec.CommandContext(ctx, mariadbBin, fullArgs...)
-	uc.logger.Info("Executing MariaDB backup command", "command", cmd.String())
+	uc.logger.InfoContext(parentCtx, "executing MariaDB backup command", "command", cmd.String())
 
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
@@ -297,7 +297,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	}
 
 	if err := zstdWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close zstd writer", "error", err)
+		uc.logger.ErrorContext(parentCtx, "failed to close zstd writer", "error", err)
 	}
 	if err := uc.closeWriters(encryptionWriter, storageWriter); err != nil {
 		<-saveErrCh
@@ -481,7 +481,7 @@ func (uc *CreateMariadbBackupUsecase) setupBackupEncryption(
 
 	if backupConfig.Encryption != backups_core_enums.BackupEncryptionEncrypted {
 		metadata.Encryption = backups_core_enums.BackupEncryptionNone
-		uc.logger.Info("Encryption disabled for backup", "backupId", backupID)
+		uc.logger.Info("encryption disabled for backup", "backup_id", backupID)
 		return storageWriter, nil, metadata, nil
 	}
 
@@ -499,7 +499,7 @@ func (uc *CreateMariadbBackupUsecase) setupBackupEncryption(
 	metadata.EncryptionIV = &encSetup.NonceBase64
 	metadata.Encryption = backups_core_enums.BackupEncryptionEncrypted
 
-	uc.logger.Info("Encryption enabled for backup", "backupId", backupID)
+	uc.logger.Info("encryption enabled for backup", "backup_id", backupID)
 	return encSetup.Writer, encSetup.Writer, metadata, nil
 }
 
@@ -534,7 +534,7 @@ func (uc *CreateMariadbBackupUsecase) cleanupOnCancellation(
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer during cancellation", "error", err)
+		uc.logger.Error("failed to close pipe writer during cancellation", "error", err)
 	}
 
 	<-saveErrCh
@@ -549,7 +549,7 @@ func (uc *CreateMariadbBackupUsecase) closeWriters(
 		go func() {
 			closeErr := encryptionWriter.Close()
 			if closeErr != nil {
-				uc.logger.Error("Failed to close encrypting writer", "error", closeErr)
+				uc.logger.Error("failed to close encrypting writer", "error", closeErr)
 			}
 			encryptionCloseErrCh <- closeErr
 		}()
@@ -560,13 +560,13 @@ func (uc *CreateMariadbBackupUsecase) closeWriters(
 	encryptionCloseErr := <-encryptionCloseErrCh
 	if encryptionCloseErr != nil {
 		if err := storageWriter.Close(); err != nil {
-			uc.logger.Error("Failed to close pipe writer after encryption error", "error", err)
+			uc.logger.Error("failed to close pipe writer after encryption error", "error", err)
 		}
 		return fmt.Errorf("failed to close encryption writer: %w", encryptionCloseErr)
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer", "error", err)
+		uc.logger.Error("failed to close pipe writer", "error", err)
 		return err
 	}
 
